@@ -7,8 +7,11 @@ for the full design.
 ## Setup
 
 1. Install XcodeGen:
-   - `brew install xcodegen`, or
-   - download a release binary from https://github.com/yonaskolb/XcodeGen/releases
+   - **Xcode 15.x users: use XcodeGen ≤ 2.42.0** — 2.43+ emits an Xcode 16 project
+     format (`objectVersion = 77`) that Xcode 15 refuses to open
+     ("future Xcode project file format"). Grab 2.42.0 from
+     https://github.com/yonaskolb/XcodeGen/releases/download/2.42.0/xcodegen.zip
+   - Xcode 16+: `brew install xcodegen` (any version works)
 2. Generate the Xcode project:
    ```
    xcodegen generate
