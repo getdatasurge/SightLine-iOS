@@ -1,0 +1,15 @@
+import SwiftUI
+
+@main
+struct SightLineFieldApp: App {
+    @State private var dependencies = AppDependencies()
+
+    var body: some Scene {
+        WindowGroup {
+            RootView()
+                .environment(dependencies.session)
+                .modelContainer(dependencies.modelContainer)
+                .task { await dependencies.session.bootstrap() }
+        }
+    }
+}

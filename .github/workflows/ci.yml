@@ -1,0 +1,21 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  build-test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate
+      - name: Build and test
+        run: |
+          SIM_NAME=$(xcrun simctl list devices available | grep -m1 -E '^\s+iPhone' | sed -E 's/^ +//; s/ \(.*//')
+          echo "Using simulator: $SIM_NAME"
+          xcodebuild -project SightLineField.xcodeproj -scheme SightLineField \
+            -destination "platform=iOS Simulator,name=$SIM_NAME" \
+            -skipPackagePluginValidation build test

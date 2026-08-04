@@ -87,3 +87,7 @@ Cross-feature imports only via each feature's public surface (mirrors the server
 - **M3** — check-in/out writes, online-only; photos; status advance.
 - **M4** — offline outbox + sync worker, conflict UX, clock-skew flagging.
 - **M5** — offline survey capture port (deferred, own brief).
+
+## Deviations from spec (verified against the live M1 server during implementation)
+- Auth endpoints are `/device-auth/login`, `/device-auth/refresh`, `DELETE /device-auth/sessions/{id}` — not `/auth/*`. There is no `/auth/me`; `AccountContext` is built from the login response and persisted locally (UserDefaults, non-secret metadata; tokens stay in Keychain). `technicianId`/`capabilities` stay `nil`/`[]` until M2 backend endpoints exist.
+- Debug default base URL is `http://localhost:3005` (second dev server running `integration/field-app`), not `3000` (occupied by the standing staging-merge stack).
