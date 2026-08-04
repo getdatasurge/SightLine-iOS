@@ -8,14 +8,14 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.2.app
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate project
         run: xcodegen generate
       - name: Build and test
         run: |
+          SIM_NAME=$(xcrun simctl list devices available | grep -m1 -E '^\s+iPhone' | sed -E 's/^ +//; s/ \(.*//')
+          echo "Using simulator: $SIM_NAME"
           xcodebuild -project SightLineField.xcodeproj -scheme SightLineField \
-            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            -destination "platform=iOS Simulator,name=$SIM_NAME" \
             -skipPackagePluginValidation build test
