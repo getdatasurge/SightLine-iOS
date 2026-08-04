@@ -60,3 +60,6 @@ targets:
         product: OpenAPIRuntime
       - package: HTTPTypes
         product: HTTPTypes
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
