@@ -5,8 +5,10 @@ final class StubAuthGateway: AuthGateway, @unchecked Sendable {
     var loginResult: Result<(TokenPair, AccountContext), Error>
     var refreshResult: Result<TokenPair, Error>
     var logoutThrows: Bool
+    var refreshDelayNanoseconds: UInt64 = 0
     private(set) var logoutCallCount = 0
     private(set) var lastLogoutSessionId: String?
+    private(set) var refreshCallCount = 0
 
     init(
         loginResult: Result<(TokenPair, AccountContext), Error> = .failure(ApiError.unauthorized),
@@ -22,7 +24,13 @@ final class StubAuthGateway: AuthGateway, @unchecked Sendable {
         try loginResult.get()
     }
 
-    func refresh(refreshToken: String) async throws -> TokenPair { try refreshResult.get() }
+    func refresh(refreshToken: String) async throws -> TokenPair {
+        refreshCallCount += 1
+        if refreshDelayNanoseconds > 0 {
+            try? await Task.sleep(nanoseconds: refreshDelayNanoseconds)
+        }
+        return try refreshResult.get()
+    }
 
     func logout(sessionId: String) async {
         // `logoutThrows` documents that a real network failure occurred and was swallowed —
@@ -112,5 +120,42 @@ final class SessionManagerTests: XCTestCase {
         await sm.bootstrap()
         XCTAssertEqual(sm.state, .signedOut)
         XCTAssertNil(store.load())
+    }
+
+    func testConcurrentRefreshCoalescesIntoOneGatewayCall() async throws {
+        let store = InMemoryTokenStore()
+        try store.save(TokenPair(accessToken: "old", refreshToken: "r1"))
+        let gw = StubAuthGateway(refreshResult: .success(TokenPair(accessToken: "new", refreshToken: "r2")))
+        gw.refreshDelayNanoseconds = 50_000_000 // 50ms: wide enough for both callers to overlap
+        let sm = SessionManager(gateway: gw, tokenStore: store, defaults: freshDefaults())
+        async let first = sm.refreshTokens()
+        async let second = sm.refreshTokens()
+        let (firstOk, secondOk) = await (first, second)
+        XCTAssertTrue(firstOk)
+        XCTAssertTrue(secondOk)
+        XCTAssertEqual(gw.refreshCallCount, 1)
+        XCTAssertEqual(store.load(), TokenPair(accessToken: "new", refreshToken: "r2"))
+    }
+
+    func testRefreshNetworkErrorKeepsSession() async throws {
+        let store = InMemoryTokenStore()
+        let pair = TokenPair(accessToken: "old", refreshToken: "r1")
+        try store.save(pair)
+        let gw = StubAuthGateway(refreshResult: .failure(ApiError.network(URLError(.notConnectedToInternet))))
+        let sm = SessionManager(gateway: gw, tokenStore: store, defaults: freshDefaults())
+        let ok = await sm.refreshTokens()
+        XCTAssertFalse(ok)
+        XCTAssertEqual(store.load(), pair)
+        XCTAssertEqual(sm.state, .signedOut)
+    }
+
+    func testBootstrapWithContextButNoPairSignsOutAndClearsContext() async throws {
+        let store = InMemoryTokenStore()
+        let defaults = freshDefaults()
+        defaults.set(try JSONEncoder().encode(ctx()), forKey: "accountContext")
+        let sm = SessionManager(gateway: StubAuthGateway(), tokenStore: store, defaults: defaults)
+        await sm.bootstrap()
+        XCTAssertEqual(sm.state, .signedOut)
+        XCTAssertNil(defaults.data(forKey: "accountContext"))
     }
 }

@@ -18,6 +18,7 @@ final class SessionManager: TokenRefresher {
     private let defaults: UserDefaults
 
     private static let contextKey = "accountContext"
+    private var inFlightRefresh: Task<Bool, Never>?
 
     init(gateway: AuthGateway, tokenStore: TokenStore, defaults: UserDefaults = .standard) {
         self.gateway = gateway
@@ -59,11 +60,24 @@ final class SessionManager: TokenRefresher {
         state = .signedOut
     }
 
-    /// One-time-use refresh-token rotation: any failure clears the store and signs out
-    /// (theft signal) rather than retrying, since a used-up or revoked refresh token can't
-    /// be recovered from.
-    nonisolated func refreshTokens() async -> Bool { await performRefresh() }
+    /// Concurrent callers coalesce onto a single in-flight refresh: the first caller starts
+    /// it and stashes the `Task` on the actor, later callers just await that same `Task` —
+    /// so N concurrent callers still produce exactly one `gateway.refresh` call.
+    nonisolated func refreshTokens() async -> Bool { await coalescedRefresh() }
 
+    private func coalescedRefresh() async -> Bool {
+        if let inFlight = inFlightRefresh { return await inFlight.value }
+        let task = Task { await performRefresh() }
+        inFlightRefresh = task
+        defer { inFlightRefresh = nil }
+        return await task.value
+    }
+
+    /// Failure policy is split by cause: a network error is transient (offline/airplane
+    /// mode) so the pair/context/state are kept for the field app to retry later. Any other
+    /// rejection (unauthorized, server, decoding, ...) means the refresh token itself was
+    /// consumed or revoked and can't be recovered from, so it's a theft signal — clear and
+    /// sign out.
     private func performRefresh() async -> Bool {
         guard let pair = tokenStore.load() else {
             clearAll()
@@ -72,8 +86,19 @@ final class SessionManager: TokenRefresher {
         }
         do {
             let newPair = try await gateway.refresh(refreshToken: pair.refreshToken)
-            try tokenStore.save(newPair)
+            do {
+                try tokenStore.save(newPair)
+            } catch {
+                // The server already rotated the refresh token (the old one is now invalid)
+                // but we failed to persist the new pair locally — either way the usable pair
+                // is lost, so treat it the same as a rejection: clear and sign out.
+                clearAll()
+                state = .signedOut
+                return false
+            }
             return true
+        } catch ApiError.network {
+            return false
         } catch {
             clearAll()
             state = .signedOut
