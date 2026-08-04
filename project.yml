@@ -11,11 +11,17 @@ packages:
   OpenAPIURLSession:
     url: https://github.com/apple/swift-openapi-urlsession
     from: 1.0.2
+  OpenAPIGenerator:
+    url: https://github.com/apple/swift-openapi-generator
+    from: 1.7.0
 targets:
   SightLineField:
     type: application
     platform: iOS
     sources: [SightLineField]
+    buildToolPlugins:
+      - plugin: OpenAPIGenerator
+        package: OpenAPIGenerator
     dependencies:
       - package: OpenAPIRuntime
         product: OpenAPIRuntime
