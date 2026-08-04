@@ -45,13 +45,20 @@ protocol AuthGateway: Sendable {
 
 /// Wraps the generated `Client` for `/device-auth/*`. There is no `/auth/me`: the account
 /// context is built entirely from the login response's `session` object.
+///
+/// Operation names below (`post_sol_device_hyphen_auth_sol_login` etc.) are
+/// `swift-openapi-generator`'s literal output, not a typo: the spec declares no
+/// `operationId`s, and `openapi-generator-config.yaml` doesn't opt into `namingStrategy:
+/// idiomatic`, so the default `defensive` strategy escapes every `/` and `-` in
+/// `<method><path>` into `_sol_`/`_hyphen_` instead of camelCasing it. Verified against a
+/// real generator run (`.superpowers/sdd/task-10-report.md`) rather than hand-derived.
 struct LiveAuthGateway: AuthGateway {
     let client: Client
 
     func login(email: String, password: String, device: DeviceInfo) async throws -> (TokenPair, AccountContext) {
-        let response: Operations.PostDeviceAuthLogin.Output
+        let response: Operations.post_sol_device_hyphen_auth_sol_login.Output
         do {
-            response = try await client.postDeviceAuthLogin(
+            response = try await client.post_sol_device_hyphen_auth_sol_login(
                 .init(
                     body: .json(
                         .init(
@@ -74,7 +81,7 @@ struct LiveAuthGateway: AuthGateway {
         switch response {
         case .created(let created):
             let payload = try created.body.json
-            let data = try decodeData(payload.data, as: DeviceAuthLoginData.self)
+            let data = try decodeData(payload.data.additionalProperties, as: DeviceAuthLoginData.self)
             let pair = TokenPair(accessToken: data.accessToken, refreshToken: data.refreshToken)
             let context = AccountContext(
                 accountId: data.session.accountId,
@@ -97,16 +104,16 @@ struct LiveAuthGateway: AuthGateway {
     }
 
     func refresh(refreshToken: String) async throws -> TokenPair {
-        let response: Operations.PostDeviceAuthRefresh.Output
+        let response: Operations.post_sol_device_hyphen_auth_sol_refresh.Output
         do {
-            response = try await client.postDeviceAuthRefresh(.init(body: .json(.init(refreshToken: refreshToken))))
+            response = try await client.post_sol_device_hyphen_auth_sol_refresh(.init(body: .json(.init(refreshToken: refreshToken))))
         } catch {
             throw ApiError.network(error)
         }
         switch response {
         case .ok(let ok):
             let payload = try ok.body.json
-            let data = try decodeData(payload.data, as: DeviceAuthRefreshData.self)
+            let data = try decodeData(payload.data.additionalProperties, as: DeviceAuthRefreshData.self)
             return TokenPair(accessToken: data.accessToken, refreshToken: data.refreshToken)
         case .unauthorized: throw ApiError.unauthorized
         case .badRequest: throw ApiError.server(status: 400)
@@ -122,7 +129,7 @@ struct LiveAuthGateway: AuthGateway {
     /// Own-session logout. Best-effort: the seam never throws, matching `AuthGateway.logout`'s
     /// no-throw contract, so `SessionManager.logout()` always clears local state.
     func logout(sessionId: String) async {
-        _ = try? await client.deleteDeviceAuthSessionsId(.init(path: .init(id: sessionId)))
+        _ = try? await client.delete_sol_device_hyphen_auth_sol_sessions_sol__lcub_id_rcub_(.init(path: .init(id: sessionId)))
     }
 
     private func decodeData<T: Decodable>(_ container: OpenAPIObjectContainer, as type: T.Type) throws -> T {
