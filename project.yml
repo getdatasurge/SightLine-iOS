@@ -1,0 +1,41 @@
+name: SightLineField
+options:
+  bundleIdPrefix: com.getdatasurge.sightline
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+packages:
+  OpenAPIRuntime:
+    url: https://github.com/apple/swift-openapi-runtime
+    from: 1.5.0
+  OpenAPIURLSession:
+    url: https://github.com/apple/swift-openapi-urlsession
+    from: 1.0.2
+targets:
+  SightLineField:
+    type: application
+    platform: iOS
+    sources: [SightLineField]
+    dependencies:
+      - package: OpenAPIRuntime
+        product: OpenAPIRuntime
+      - package: OpenAPIURLSession
+        product: OpenAPIURLSession
+    info:
+      path: SightLineField/Info.plist
+      properties:
+        CFBundleDisplayName: SightLine Field
+        UILaunchScreen: {}
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.getdatasurge.sightline.field
+        SWIFT_VERSION: "5.10"
+        TARGETED_DEVICE_FAMILY: "1"
+  SightLineFieldTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [SightLineFieldTests]
+    dependencies:
+      - target: SightLineField
