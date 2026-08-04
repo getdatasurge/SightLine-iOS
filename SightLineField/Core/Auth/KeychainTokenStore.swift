@@ -22,22 +22,33 @@ final class KeychainTokenStore: TokenStore {
         var item: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
               let data = item as? Data else { return nil }
-        return try? JSONDecoder().decode(TokenPair.self, from: data)
+        guard let pair = try? JSONDecoder().decode(TokenPair.self, from: data) else {
+            assertionFailure("corrupt token data in keychain")
+            return nil
+        }
+        return pair
     }
 
     func save(_ pair: TokenPair) throws {
         let data = try JSONEncoder().encode(pair)
-        clear()
-        var query = baseQuery
-        query[kSecValueData as String] = data
-        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        let status = SecItemAdd(query as CFDictionary, nil)
+        let update: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+        var status = SecItemUpdate(baseQuery as CFDictionary, update as CFDictionary)
+        if status == errSecItemNotFound {
+            var query = baseQuery
+            query[kSecValueData as String] = data
+            query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            status = SecItemAdd(query as CFDictionary, nil)
+        }
         guard status == errSecSuccess else { throw KeychainError(status: status) }
     }
 
     func clear() { SecItemDelete(baseQuery as CFDictionary) }
 }
 
+// @unchecked: NSLock serializes all state access
 final class InMemoryTokenStore: TokenStore, @unchecked Sendable {
     private var pair: TokenPair?
     private let lock = NSLock()
