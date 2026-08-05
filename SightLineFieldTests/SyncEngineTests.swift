@@ -7,7 +7,7 @@ final class StubSyncBackend: SyncBackend, @unchecked Sendable {
     var appointmentsResult: Result<[AppointmentDTO], Error> = .success([])
     var workTypesResult: Result<[WorkTypeDTO], Error> = .success([])
     var workLogsResult: Result<[WorkLogDTO], Error> = .success([])
-    var surfacesResult: Result<[SurfaceDTO], Error> = .success([])
+    var surfacesResult: Result<[SurfaceRecord], Error> = .success([])
 
     /// Artificial delay inside `fetchJobs`, used to widen the overlap window for the
     /// reentrancy test.
@@ -42,7 +42,7 @@ final class StubSyncBackend: SyncBackend, @unchecked Sendable {
         return try workLogsResult.get()
     }
 
-    func fetchSurfaces(since: Date?) async throws -> [SurfaceDTO] {
+    func fetchSurfaces(since: Date?) async throws -> [SurfaceRecord] {
         surfacesSinceCalls.append(since)
         return try surfacesResult.get()
     }
@@ -63,8 +63,8 @@ final class SyncEngineTests: XCTestCase {
         let t1 = Date(timeIntervalSince1970: 1_000_000)
         let t2 = Date(timeIntervalSince1970: 1_000_500)
         stub.jobsResult = .success([
-            JobDTO(id: "job-1", name: "Acme HQ", address: nil, status: "OPEN", updatedAt: t1),
-            JobDTO(id: "job-2", name: "Beta Site", address: "2 Main St", status: "OPEN", updatedAt: t2),
+            JobDTO(id: "job-1", title: "Acme HQ", status: "OPEN", customer: nil, updatedAt: t1),
+            JobDTO(id: "job-2", title: "Beta Site", status: "OPEN", customer: JobDTO.Customer(name: "Beta Co"), updatedAt: t2),
         ])
         let watermarks = SyncWatermarks(defaults: freshDefaults())
         let engine = SyncEngine(backend: stub, modelContext: try makeContext(), watermarks: watermarks)
@@ -74,7 +74,7 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertEqual(watermarks.get(.jobs), t2) // advanced to the max updatedAt seen
 
         stub.jobsResult = .success([
-            JobDTO(id: "job-3", name: "Gamma", address: nil, status: "OPEN", updatedAt: t2.addingTimeInterval(60))
+            JobDTO(id: "job-3", title: "Gamma", status: "OPEN", customer: nil, updatedAt: t2.addingTimeInterval(60))
         ])
         await engine.syncAll()
         XCTAssertEqual(stub.jobsSinceCalls, [nil, t2]) // delta from the persisted watermark
@@ -86,8 +86,8 @@ final class SyncEngineTests: XCTestCase {
         let t2 = t1.addingTimeInterval(10)
         // Same id twice in one page (e.g. a cursor-page overlap) — the newer one must win, no dupe row.
         stub.jobsResult = .success([
-            JobDTO(id: "job-1", name: "Stale", address: nil, status: "OPEN", updatedAt: t1),
-            JobDTO(id: "job-1", name: "Fresh", address: nil, status: "OPEN", updatedAt: t2),
+            JobDTO(id: "job-1", title: "Stale", status: "OPEN", customer: nil, updatedAt: t1),
+            JobDTO(id: "job-1", title: "Fresh", status: "OPEN", customer: nil, updatedAt: t2),
         ])
         let context = try makeContext()
         let engine = SyncEngine(backend: stub, modelContext: context, watermarks: SyncWatermarks(defaults: freshDefaults()))
@@ -99,7 +99,7 @@ final class SyncEngineTests: XCTestCase {
 
         // Second pass: server reports an update to the same id — must update in place, not duplicate.
         stub.jobsResult = .success([
-            JobDTO(id: "job-1", name: "Updated Again", address: "42 Main", status: "CLOSED", updatedAt: t2.addingTimeInterval(10))
+            JobDTO(id: "job-1", title: "Updated Again", status: "CLOSED", customer: JobDTO.Customer(name: "42 Main Co"), updatedAt: t2.addingTimeInterval(10))
         ])
         await engine.syncAll()
         jobs = try context.fetch(FetchDescriptor<JobSummary>())
@@ -111,8 +111,8 @@ final class SyncEngineTests: XCTestCase {
     func testPerCollectionErrorIsolatesFailureAndContinues() async throws {
         let stub = StubSyncBackend()
         let now = Date(timeIntervalSince1970: 3_000_000)
-        stub.jobsResult = .success([JobDTO(id: "job-1", name: "Acme", address: nil, status: "OPEN", updatedAt: now)])
-        stub.workTypesResult = .success([WorkTypeDTO(id: "wt-1", name: "Tint", unit: "sqft", updatedAt: now)])
+        stub.jobsResult = .success([JobDTO(id: "job-1", title: "Acme", status: "OPEN", customer: nil, updatedAt: now)])
+        stub.workTypesResult = .success([WorkTypeDTO(id: "wt-1", name: "Tint", unit: "sqft", isActive: true, updatedAt: now)])
         stub.workLogsResult = .failure(ApiError.server(status: 500))
         let context = try makeContext()
         let engine = SyncEngine(backend: stub, modelContext: context, watermarks: SyncWatermarks(defaults: freshDefaults()))
@@ -159,7 +159,7 @@ final class SyncEngineTests: XCTestCase {
         // Recovery: this pass succeeds and should finally advance the watermark.
         let t1 = Date(timeIntervalSince1970: 4_000_000)
         stub.workLogsResult = .success([
-            WorkLogDTO(id: "wl-1", jobId: "job-1", technicianId: nil, workTypeId: nil, checkInAt: t1, checkOutAt: nil, quantity: nil, status: "CHECKED_IN", updatedAt: t1)
+            WorkLogDTO(id: "wl-1", jobId: "job-1", technicianId: nil, workTypeId: nil, checkInAt: t1, checkOutAt: nil, quantity: nil, notes: nil, status: "CHECKED_IN", updatedAt: t1)
         ])
         await engine.syncAll()
         XCTAssertEqual(stub.workLogsSinceCalls, [nil, nil, nil])

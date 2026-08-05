@@ -7,29 +7,47 @@ import OpenAPIRuntime
 /// SwiftData. Fields are a subset of what the API actually returns — e.g. `JobDTO` carries no
 /// price fields (`/jobs` is price-blind) — trimmed to what the local store persists.
 struct JobDTO: Decodable, Equatable, Sendable {
+    /// `/jobs`' `customer` is a derived `{id, name}` projection, not a raw column — modeled as
+    /// optional here defensively even though a job's `customerId` FK is currently required.
+    struct Customer: Decodable, Equatable, Sendable {
+        let name: String
+    }
+
     let id: String
-    let name: String
-    let address: String?
+    let title: String
     let status: String
+    let customer: Customer?
     let updatedAt: Date
 }
 
-/// `jobId`/`technicianId` are optional: an appointment can exist unassigned to either.
+/// `jobId`/`technicianId` are optional: an appointment can exist unassigned to either. The API
+/// has no top-level `title` — `SyncEngine.syncAppointments` derives the local model's title from
+/// `notes`, falling back to the linked job's `number` (via `job`), then a generic label.
 struct AppointmentDTO: Decodable, Equatable, Sendable {
+    /// Lean nested job projection: only `number` is needed, as a title fallback. `Job.number`
+    /// is a required column, so once `job` itself is present its `number` always is too.
+    struct JobRef: Decodable, Equatable, Sendable {
+        let number: String
+    }
+
     let id: String
     let jobId: String?
     let technicianId: String?
-    let start: Date
-    let end: Date
+    let startsAt: Date
+    let endsAt: Date
     let status: String
-    let title: String
+    let notes: String?
+    let job: JobRef?
     let updatedAt: Date
 }
 
+/// `isActive` is optional — the M2 API projection may still omit it; see `SyncEngine
+/// .syncWorkTypes` for the fallback behavior when it's missing.
 struct WorkTypeDTO: Decodable, Equatable, Sendable {
     let id: String
     let name: String
     let unit: String
+    let isActive: Bool?
     let updatedAt: Date
 }
 
@@ -42,17 +60,27 @@ struct WorkLogDTO: Decodable, Equatable, Sendable {
     let checkInAt: Date
     let checkOutAt: Date?
     let quantity: Double?
+    let notes: String?
     let status: String
     let updatedAt: Date
 }
 
+/// No `jobId` — a `Surface` isn't a direct child of `Job` server-side, so `/jobs/{id}/surfaces`
+/// items don't carry one. `LiveSyncBackend.fetchSurfaces` already knows it from the path it just
+/// called and attaches it via `SurfaceRecord`.
 struct SurfaceDTO: Decodable, Equatable, Sendable {
     let id: String
-    let jobId: String
     let label: String
     let status: String
     let notes: String?
     let updatedAt: Date
+}
+
+/// A `SurfaceDTO` paired with the id of the job it was fetched under — see `SurfaceDTO`'s doc
+/// comment for why that pairing has to happen out here instead of inside the DTO.
+struct SurfaceRecord: Equatable, Sendable {
+    let jobId: String
+    let surface: SurfaceDTO
 }
 
 // MARK: - SyncBackend
@@ -67,7 +95,7 @@ protocol SyncBackend: Sendable {
     func fetchAppointments(since: Date?) async throws -> [AppointmentDTO]
     func fetchWorkTypes(since: Date?) async throws -> [WorkTypeDTO]
     func fetchWorkLogs(since: Date?) async throws -> [WorkLogDTO]
-    func fetchSurfaces(since: Date?) async throws -> [SurfaceDTO]
+    func fetchSurfaces(since: Date?) async throws -> [SurfaceRecord]
 }
 
 // MARK: - LiveSyncBackend
@@ -137,6 +165,9 @@ struct LiveSyncBackend: SyncBackend {
         switch output {
         case .ok(let ok):
             let payload = try ok.body.json
+            // regen-pending: the generated envelope still requires `pagination` (unused here —
+            // `/work-types` returns its one page unpaginated). Once the backend response and the
+            // generated client both go data-only, this stays exactly `payload.data.map { ... }`.
             return try payload.data.map { try decode($0.additionalProperties, as: WorkTypeDTO.self) }
         case .badRequest: throw ApiError.server(status: 400)
         case .unauthorized: throw ApiError.unauthorized
@@ -178,9 +209,9 @@ struct LiveSyncBackend: SyncBackend {
         }
     }
 
-    func fetchSurfaces(since: Date?) async throws -> [SurfaceDTO] {
+    func fetchSurfaces(since: Date?) async throws -> [SurfaceRecord] {
         let jobIds = try await fetchAllJobs(updatedAfter: nil).map(\.id)
-        var surfaces: [SurfaceDTO] = []
+        var surfaces: [SurfaceRecord] = []
         for jobId in jobIds {
             let input = Operations.get_sol_jobs_sol__lcub_id_rcub__sol_surfaces.Input(
                 path: .init(id: jobId),
@@ -195,7 +226,8 @@ struct LiveSyncBackend: SyncBackend {
             switch output {
             case .ok(let ok):
                 let payload = try ok.body.json
-                surfaces += try payload.data.map { try decode($0.additionalProperties, as: SurfaceDTO.self) }
+                let items = try payload.data.map { try decode($0.additionalProperties, as: SurfaceDTO.self) }
+                surfaces += items.map { SurfaceRecord(jobId: jobId, surface: $0) }
             case .badRequest: throw ApiError.server(status: 400)
             case .unauthorized: throw ApiError.unauthorized
             case .forbidden: throw ApiError.server(status: 403)

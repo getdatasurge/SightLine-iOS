@@ -64,6 +64,9 @@ final class SyncEngine {
 
     // MARK: - Per-collection sync
 
+    /// The API has no separate street-address field for a job — `JobSummary.address` (the
+    /// model's only free-text secondary line) is repurposed to hold the customer's display name
+    /// instead, since that's the closest identifying line `/jobs` actually projects.
     private func syncJobs() async throws {
         let watermark = watermarks.get(.jobs)
         let dtos = try await backend.fetchJobs(since: SyncPlanner.decide(watermark: watermark).since)
@@ -84,12 +87,12 @@ final class SyncEngine {
         for plan in plans {
             guard let dto = dtoById[plan.record.id] else { continue }
             if let model = existingById[plan.record.id] {
-                model.name = dto.name
-                model.address = dto.address
+                model.name = dto.title
+                model.address = dto.customer?.name
                 model.status = dto.status
                 model.updatedAt = dto.updatedAt
             } else {
-                modelContext.insert(JobSummary(id: dto.id, name: dto.name, address: dto.address, status: dto.status, updatedAt: dto.updatedAt))
+                modelContext.insert(JobSummary(id: dto.id, name: dto.title, address: dto.customer?.name, status: dto.status, updatedAt: dto.updatedAt))
             }
         }
         try modelContext.save()
@@ -100,7 +103,9 @@ final class SyncEngine {
     }
 
     /// `AppointmentDTO.technicianId` isn't persisted — `Appointment` has no such column yet;
-    /// only the fields the local model already declares are copied over.
+    /// only the fields the local model already declares are copied over. `title` has no wire
+    /// equivalent: `notes` (technician-entered) doubles as the display title, falling back to
+    /// the linked job's `number`, then a generic label.
     private func syncAppointments() async throws {
         let watermark = watermarks.get(.appointments)
         let dtos = try await backend.fetchAppointments(since: SyncPlanner.decide(watermark: watermark).since)
@@ -118,16 +123,17 @@ final class SyncEngine {
         )
         for plan in plans {
             guard let dto = dtoById[plan.record.id] else { continue }
+            let title = dto.notes ?? dto.job?.number ?? "Appointment"
             if let model = existingById[plan.record.id] {
                 model.jobId = dto.jobId
-                model.title = dto.title
-                model.start = dto.start
-                model.end = dto.end
+                model.title = title
+                model.start = dto.startsAt
+                model.end = dto.endsAt
                 model.status = dto.status
                 model.updatedAt = dto.updatedAt
             } else {
                 modelContext.insert(
-                    Appointment(id: dto.id, jobId: dto.jobId, title: dto.title, start: dto.start, end: dto.end, status: dto.status, updatedAt: dto.updatedAt)
+                    Appointment(id: dto.id, jobId: dto.jobId, title: title, start: dto.startsAt, end: dto.endsAt, status: dto.status, updatedAt: dto.updatedAt)
                 )
             }
         }
@@ -138,9 +144,9 @@ final class SyncEngine {
         }
     }
 
-    /// `WorkTypeDTO` carries no `isActive` (not part of the M2 API projection). A freshly
-    /// discovered work type defaults to active; an existing one's `isActive` is left untouched
-    /// on update rather than stomped, since the DTO has no authoritative value for it.
+    /// `WorkTypeDTO.isActive` is optional — the API may still omit it during the M2 rollout.
+    /// When present it's applied; when absent, a freshly discovered work type defaults to
+    /// active and an existing one's `isActive` is left untouched rather than stomped.
     private func syncWorkTypes() async throws {
         let watermark = watermarks.get(.workTypes)
         let dtos = try await backend.fetchWorkTypes(since: SyncPlanner.decide(watermark: watermark).since)
@@ -161,9 +167,12 @@ final class SyncEngine {
             if let model = existingById[plan.record.id] {
                 model.name = dto.name
                 model.unit = dto.unit
+                if let isActive = dto.isActive {
+                    model.isActive = isActive
+                }
                 model.updatedAt = dto.updatedAt
             } else {
-                modelContext.insert(WorkType(id: dto.id, name: dto.name, unit: dto.unit, isActive: true, updatedAt: dto.updatedAt))
+                modelContext.insert(WorkType(id: dto.id, name: dto.name, unit: dto.unit, isActive: dto.isActive ?? true, updatedAt: dto.updatedAt))
             }
         }
         try modelContext.save()
@@ -202,6 +211,7 @@ final class SyncEngine {
                 model.checkInAt = dto.checkInAt
                 model.checkOutAt = dto.checkOutAt
                 model.quantity = dto.quantity
+                model.notes = dto.notes
                 model.updatedAt = dto.updatedAt
             } else {
                 modelContext.insert(
@@ -214,6 +224,7 @@ final class SyncEngine {
                         checkInAt: dto.checkInAt,
                         checkOutAt: dto.checkOutAt,
                         quantity: dto.quantity,
+                        notes: dto.notes,
                         updatedAt: dto.updatedAt
                     )
                 )
@@ -226,36 +237,38 @@ final class SyncEngine {
         }
     }
 
-    /// `SurfaceDTO.notes` isn't persisted (no such column on `Surface` yet).
+    /// `SurfaceDTO.notes` isn't persisted (no such column on `Surface` yet). `SurfaceRecord
+    /// .jobId` — injected by `LiveSyncBackend` since the wire item itself carries none — is
+    /// what actually links the row to its job locally.
     private func syncSurfaces() async throws {
         let watermark = watermarks.get(.surfaces)
         let dtos = try await backend.fetchSurfaces(since: SyncPlanner.decide(watermark: watermark).since)
         guard !dtos.isEmpty else { return }
 
-        let ids = Set(dtos.map(\.id))
+        let ids = Set(dtos.map { $0.surface.id })
         let existing = try modelContext.fetch(FetchDescriptor<Surface>(predicate: #Predicate { ids.contains($0.id) }))
         let existingById = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
         // See `syncJobs`'s `dtoById` comment: mirrors `planUpserts`'s newest-wins tie-break.
-        let dtoById = Dictionary(dtos.map { ($0.id, $0) }, uniquingKeysWith: { current, new in current.updatedAt >= new.updatedAt ? current : new })
+        let dtoById = Dictionary(dtos.map { ($0.surface.id, $0) }, uniquingKeysWith: { current, new in current.surface.updatedAt >= new.surface.updatedAt ? current : new })
 
         let plans = SyncPlanner.planUpserts(
-            incoming: dtos.map { SyncRecord(id: $0.id, updatedAt: $0.updatedAt) },
+            incoming: dtos.map { SyncRecord(id: $0.surface.id, updatedAt: $0.surface.updatedAt) },
             existingIds: Set(existingById.keys)
         )
         for plan in plans {
             guard let dto = dtoById[plan.record.id] else { continue }
             if let model = existingById[plan.record.id] {
                 model.jobId = dto.jobId
-                model.label = dto.label
-                model.status = dto.status
-                model.updatedAt = dto.updatedAt
+                model.label = dto.surface.label
+                model.status = dto.surface.status
+                model.updatedAt = dto.surface.updatedAt
             } else {
-                modelContext.insert(Surface(id: dto.id, jobId: dto.jobId, label: dto.label, status: dto.status, updatedAt: dto.updatedAt))
+                modelContext.insert(Surface(id: dto.surface.id, jobId: dto.jobId, label: dto.surface.label, status: dto.surface.status, updatedAt: dto.surface.updatedAt))
             }
         }
         try modelContext.save()
 
-        if let advanced = SyncPlanner.advance(current: watermark, seen: dtos.map(\.updatedAt)) {
+        if let advanced = SyncPlanner.advance(current: watermark, seen: dtos.map { $0.surface.updatedAt }) {
             watermarks.set(.surfaces, to: advanced)
         }
     }
