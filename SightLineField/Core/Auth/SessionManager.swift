@@ -65,6 +65,18 @@ final class SessionManager: TokenRefresher {
     /// so N concurrent callers still produce exactly one `gateway.refresh` call.
     nonisolated func refreshTokens() async -> Bool { await coalescedRefresh() }
 
+    /// Called by `BearerAuthMiddleware` when a request still gets 401 after a successful
+    /// refresh — the session itself was invalidated server-side (theft/reuse signal), not
+    /// just the access token. Reuses the same clear-and-sign-out path as a rejected refresh.
+    nonisolated func sessionInvalidated() async {
+        await performSessionInvalidation()
+    }
+
+    private func performSessionInvalidation() {
+        clearAll()
+        state = .signedOut
+    }
+
     private func coalescedRefresh() async -> Bool {
         if let inFlight = inFlightRefresh { return await inFlight.value }
         let task = Task { await performRefresh() }

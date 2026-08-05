@@ -6,7 +6,9 @@ import HTTPTypes
 final class RefresherSpy: TokenRefresher, @unchecked Sendable {
     var result = false
     private(set) var calls = 0
+    private(set) var invalidatedCalls = 0
     func refreshTokens() async -> Bool { calls += 1; return result }
+    func sessionInvalidated() async { invalidatedCalls += 1 }
 }
 
 final class BearerAuthMiddlewareTests: XCTestCase {
@@ -45,5 +47,22 @@ final class BearerAuthMiddlewareTests: XCTestCase {
         let resp = try await run(BearerAuthMiddleware(tokenStore: store, refresher: spy), statuses: [401, 401])
         XCTAssertEqual(resp.status.code, 401)
         XCTAssertEqual(spy.calls, 1)
+    }
+
+    func testSecond401CallsSessionInvalidatedExactlyOnce() async throws {
+        let store = InMemoryTokenStore()
+        try store.save(TokenPair(accessToken: "old", refreshToken: "r"))
+        let spy = RefresherSpy(); spy.result = true
+        _ = try await run(BearerAuthMiddleware(tokenStore: store, refresher: spy), statuses: [401, 401])
+        XCTAssertEqual(spy.invalidatedCalls, 1)
+    }
+
+    func testFailedRefreshDoesNotCallSessionInvalidated() async throws {
+        let store = InMemoryTokenStore()
+        try store.save(TokenPair(accessToken: "old", refreshToken: "r"))
+        let spy = RefresherSpy(); spy.result = false
+        let resp = try await run(BearerAuthMiddleware(tokenStore: store, refresher: spy), statuses: [401])
+        XCTAssertEqual(resp.status.code, 401)
+        XCTAssertEqual(spy.invalidatedCalls, 0)
     }
 }

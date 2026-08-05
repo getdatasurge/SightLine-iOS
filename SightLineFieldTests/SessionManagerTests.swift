@@ -158,4 +158,17 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(sm.state, .signedOut)
         XCTAssertNil(defaults.data(forKey: "accountContext"))
     }
+
+    func testSessionInvalidatedClearsStoreContextAndState() async throws {
+        let store = InMemoryTokenStore()
+        let defaults = freshDefaults()
+        let gw = StubAuthGateway(loginResult: .success((TokenPair(accessToken: "a", refreshToken: "r"), ctx())))
+        let sm = SessionManager(gateway: gw, tokenStore: store, defaults: defaults)
+        await sm.login(email: "t@x.com", password: "pw")
+        XCTAssertEqual(sm.state, .signedIn(ctx()))
+        await sm.sessionInvalidated()
+        XCTAssertNil(store.load())
+        XCTAssertEqual(sm.state, .signedOut)
+        XCTAssertNil(defaults.data(forKey: "accountContext"))
+    }
 }
