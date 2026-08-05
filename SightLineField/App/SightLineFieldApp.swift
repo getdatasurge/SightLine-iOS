@@ -10,6 +10,8 @@ struct SightLineFieldApp: App {
             RootView()
                 .environment(dependencies.session)
                 .environment(dependencies.syncEngine)
+                .environment(dependencies.workLogActions)
+                .environment(\.apiClient, dependencies.client)
                 .modelContainer(dependencies.modelContainer)
                 .task { await dependencies.session.bootstrap() }
         }

@@ -22,8 +22,10 @@ import SwiftData
 @MainActor
 final class AppDependencies {
     let session: SessionManager
+    let client: Client
     let modelContainer: ModelContainer
     let syncEngine: SyncEngine
+    let workLogActions: WorkLogActions
 
     init(environment: AppEnvironment = .resolve(), inMemoryStore: Bool = false) {
         let tokenStore = KeychainTokenStore()
@@ -40,6 +42,7 @@ final class AppDependencies {
         let gateway = LiveAuthGateway(client: client)
         let session = SessionManager(gateway: gateway, tokenStore: tokenStore)
         refresherBox.session = session
+        self.client = client
         self.session = session
 
         let container: ModelContainer
@@ -59,6 +62,8 @@ final class AppDependencies {
             modelContext: container.mainContext,
             watermarks: watermarks
         )
+
+        self.workLogActions = WorkLogActions(client: client, modelContext: container.mainContext)
 
         // Every sign-out (explicit logout, expired bootstrap, 401 theft-signal) must leave no
         // trace of the prior account on a shared installer device: drop the delta watermarks so

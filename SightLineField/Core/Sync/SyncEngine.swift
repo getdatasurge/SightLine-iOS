@@ -189,7 +189,6 @@ final class SyncEngine {
         }
     }
 
-    /// `WorkLogDTO.technicianId` isn't persisted (no such column on `WorkLog` yet).
     /// `clientUuid` is the local offline-create idempotency key — a server-sourced log has no
     /// such thing, so it reuses the server `id` (deterministic, always non-empty, and
     /// incidentally distinguishable from a locally-created-then-synced row, whose `clientUuid`
@@ -213,6 +212,7 @@ final class SyncEngine {
             guard let dto = dtoById[plan.record.id] else { continue }
             if let model = existingById[plan.record.id] {
                 model.jobId = dto.jobId
+                model.technicianId = dto.technicianId
                 model.workTypeId = dto.workTypeId
                 model.status = dto.status
                 model.checkInAt = dto.checkInAt
@@ -226,6 +226,7 @@ final class SyncEngine {
                         id: dto.id,
                         clientUuid: dto.id,
                         jobId: dto.jobId,
+                        technicianId: dto.technicianId,
                         workTypeId: dto.workTypeId,
                         status: dto.status,
                         checkInAt: dto.checkInAt,

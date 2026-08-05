@@ -61,6 +61,7 @@ final class WorkLog {
     @Attribute(.unique) var id: String
     var clientUuid: String
     var jobId: String
+    var technicianId: String?
     var workTypeId: String?
     var status: String
     var checkInAt: Date
@@ -73,6 +74,7 @@ final class WorkLog {
         id: String,
         clientUuid: String,
         jobId: String,
+        technicianId: String? = nil,
         workTypeId: String? = nil,
         status: String,
         checkInAt: Date,
@@ -84,6 +86,7 @@ final class WorkLog {
         self.id = id
         self.clientUuid = clientUuid
         self.jobId = jobId
+        self.technicianId = technicianId
         self.workTypeId = workTypeId
         self.status = status
         self.checkInAt = checkInAt
