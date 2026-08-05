@@ -7,6 +7,7 @@ import SwiftUI
 @MainActor
 struct CheckInSheet: View {
     let jobId: String
+    let technicianId: String?
 
     @Environment(WorkLogActions.self) private var workLogActions
     @Environment(\.dismiss) private var dismiss
@@ -52,22 +53,16 @@ struct CheckInSheet: View {
     }
 
     private func confirm() {
-        errorMessage = nil
         isSubmitting = true
-        Task {
-            do {
-                try await workLogActions.checkIn(
-                    jobId: jobId,
-                    workTypeId: selectedWorkTypeId,
-                    notes: notes.isEmpty ? nil : notes
-                )
-                isSubmitting = false
-                dismiss()
-            } catch {
-                isSubmitting = false
-                errorMessage = (error as? ApiError)?.userMessage ?? ApiError.decoding.userMessage
-            }
-        }
+        // Optimistic + queued (M4 A-I3): never throws, never awaits the network — the local
+        // row flips immediately and the outbox syncs it whenever it next drains.
+        workLogActions.checkIn(
+            jobId: jobId,
+            workTypeId: selectedWorkTypeId,
+            notes: notes.isEmpty ? nil : notes,
+            technicianId: technicianId
+        )
+        dismiss()
     }
 }
 
@@ -129,22 +124,14 @@ struct CheckOutSheet: View {
     }
 
     private func confirm() {
-        errorMessage = nil
         isSubmitting = true
         let quantity = Double(quantityText)
-        Task {
-            do {
-                try await workLogActions.checkOut(
-                    workLogId: workLog.id,
-                    quantity: quantity,
-                    notes: notes.isEmpty ? nil : notes
-                )
-                isSubmitting = false
-                dismiss()
-            } catch {
-                isSubmitting = false
-                errorMessage = (error as? ApiError)?.userMessage ?? ApiError.decoding.userMessage
-            }
-        }
+        // Keyed by the work-log's clientUuid (M4 A-B2), optimistic + queued — no server id needed.
+        workLogActions.checkOut(
+            workLogClientUuid: workLog.clientUuid,
+            quantity: quantity,
+            notes: notes.isEmpty ? nil : notes
+        )
+        dismiss()
     }
 }

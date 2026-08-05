@@ -19,6 +19,7 @@ struct JobDetailView: View {
     @Query private var pendingPhotoUploads: [SyncOutbox]
 
     @Environment(PhotoActions.self) private var photoActions
+    @Environment(SessionManager.self) private var session
 
     @State private var isCheckInPresented = false
     @State private var checkOutTarget: WorkLog?
@@ -47,6 +48,17 @@ struct JobDetailView: View {
     /// The caller's own open session on this job, if any — mirrors `WorkLogActions
     /// .openWorkLog(onJob:)`.
     private var openWorkLog: WorkLog? { openWorkLogs.first }
+
+    /// The signed-in account's own technician id, if the account is bound to one — threaded
+    /// into `CheckInSheet` so the optimistic row it creates carries the same `technicianId`
+    /// `WorkLogActions.openWorkLog(onJob:technicianId:)` scopes its query by, per `SettingsSheet`'s
+    /// `session.state` pattern.
+    private var technicianId: String? {
+        if case .signedIn(let account) = session.state {
+            return account.technicianId
+        }
+        return nil
+    }
 
     var body: some View {
         List {
@@ -101,11 +113,19 @@ struct JobDetailView: View {
                         }
                     }
                 }
+
+                NavigationLink {
+                    JobElevationsView(jobId: job.id)
+                } label: {
+                    Text("Elevations")
+                        .font(DS.Font.body)
+                        .foregroundStyle(DS.Color.textPrimary)
+                }
             }
         }
         .navigationTitle(job.name)
         .sheet(isPresented: $isCheckInPresented) {
-            CheckInSheet(jobId: job.id)
+            CheckInSheet(jobId: job.id, technicianId: technicianId)
         }
         .sheet(item: $checkOutTarget) { workLog in
             CheckOutSheet(workLog: workLog)
