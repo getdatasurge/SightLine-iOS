@@ -144,20 +144,20 @@ final class WorkLogActions {
     /// The caller's own open ("CHECKED_IN") work-log session on a job, if any — drives the
     /// Check In ↔ Check Out state split in `JobDetailView`/`WorkLogsView`.
     ///
-    /// `technicianId` is part of the signature per the fixed cross-task contract, but the local
-    /// `WorkLog` model (`Models.swift`, out of this task's file scope) has no persisted
-    /// `technicianId` column — every upserted/synced row is stored without one, deliberately:
-    /// `SyncEngine.syncWorkLogs`'s doc comment notes work-log sync is business-wide so a
-    /// technician can see a teammate's open session on a shared job, not just their own. Until
-    /// the store gains that column, this filters by `jobId` + `status == "CHECKED_IN"` only and
-    /// returns the most-recently-opened match if more than one technician happens to be checked
-    /// into the same job — a real possibility business-wide, but outside M3's
-    /// single-active-technician-per-job scope. Flagged to the task owner; not silently pretended
-    /// away.
+    /// Scoped to the caller's `technicianId` when known: `WorkLog.technicianId` is persisted by
+    /// `SyncEngine.syncWorkLogs` and by this class's own upserts, so a teammate's open session
+    /// on a shared job never flips this caller's UI into "Check Out". Rows synced before the
+    /// column existed carry `nil` and are excluded from the scoped query — acceptable: they
+    /// predate the caller's session on that job. With `technicianId == nil` (account has no
+    /// Technician row) falls back to job-wide, mirroring the business-wide sync stance.
     func openWorkLog(onJob jobId: String, technicianId: String?) -> WorkLog? {
-        var descriptor = FetchDescriptor<WorkLog>(
-            predicate: #Predicate<WorkLog> { $0.jobId == jobId && $0.status == "CHECKED_IN" }
-        )
+        let predicate: Predicate<WorkLog>
+        if let technicianId {
+            predicate = #Predicate<WorkLog> { $0.jobId == jobId && $0.status == "CHECKED_IN" && $0.technicianId == technicianId }
+        } else {
+            predicate = #Predicate<WorkLog> { $0.jobId == jobId && $0.status == "CHECKED_IN" }
+        }
+        var descriptor = FetchDescriptor<WorkLog>(predicate: predicate)
         descriptor.sortBy = [SortDescriptor(\.checkInAt, order: .reverse)]
         return (try? modelContext.fetch(descriptor))?.first
     }
@@ -194,6 +194,7 @@ final class WorkLogActions {
         let existing = try modelContext.fetch(FetchDescriptor<WorkLog>(predicate: #Predicate<WorkLog> { $0.id == id })).first
         if let model = existing {
             model.jobId = dto.jobId
+            model.technicianId = dto.technicianId
             model.workTypeId = dto.workTypeId
             model.status = dto.status
             model.checkInAt = dto.checkInAt
@@ -208,6 +209,7 @@ final class WorkLogActions {
             id: dto.id,
             clientUuid: newRowClientUuid,
             jobId: dto.jobId,
+            technicianId: dto.technicianId,
             workTypeId: dto.workTypeId,
             status: dto.status,
             checkInAt: dto.checkInAt,

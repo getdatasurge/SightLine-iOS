@@ -21,18 +21,10 @@ struct JobCardView: View {
 
     @State private var phase: Phase = .loading
 
-    /// Own `Client`, built the same way `AppDependencies` builds the app's shared one
-    /// (`ApiClientFactory.make`, same `KeychainTokenStore` service — so it reads the same
-    /// signed-in session) — scoped to this view rather than the composition root because
-    /// `Client` isn't currently exposed through the SwiftUI environment. `NoOpTokenRefresher`
-    /// means a request that 401s while this card is open surfaces as `ApiError.unauthorized`
-    /// (via the error state's Retry) rather than silently refreshing; acceptable for a
-    /// read-only, on-demand screen.
-    @State private var client = ApiClientFactory.make(
-        environment: .resolve(),
-        tokenStore: KeychainTokenStore(),
-        refresher: NoOpTokenRefresher()
-    )
+    /// The app's shared generated `Client`, injected from the composition root
+    /// (`SightLineFieldApp` → `\.apiClient`) so this read goes through the same
+    /// `BearerAuthMiddleware` refresh chain as every other call — no throwaway client.
+    @Environment(\.apiClient) private var client: Client?
 
     private enum Phase {
         case loading
@@ -136,6 +128,7 @@ struct JobCardView: View {
     }
 
     private func fetchAppointmentDetail() async throws -> AppointmentDetailDTO {
+        guard let client else { throw ApiError.network(ClientNotInjectedError()) }
         let output: Operations.get_sol_appointments_sol__lcub_id_rcub_.Output
         do {
             output = try await client.get_sol_appointments_sol__lcub_id_rcub_(path: .init(id: appointmentId))
@@ -219,9 +212,6 @@ struct AppointmentDetailDTO: Decodable, Equatable, Sendable {
     let job: Job?
 }
 
-/// No-op `TokenRefresher` for `JobCardView`'s standalone `Client` — see the view's `client`
-/// doc comment. A 401 here just surfaces as `ApiError.unauthorized` via the error state.
-private struct NoOpTokenRefresher: TokenRefresher {
-    func refreshTokens() async -> Bool { false }
-    func sessionInvalidated() async {}
-}
+/// `\.apiClient` was never injected (composition-root wiring bug) — surfaced as a network
+/// error so the card's Retry/error state renders instead of crashing.
+struct ClientNotInjectedError: Error {}
