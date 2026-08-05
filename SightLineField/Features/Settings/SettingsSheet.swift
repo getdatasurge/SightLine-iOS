@@ -3,6 +3,7 @@ import SwiftUI
 @MainActor
 struct SettingsSheet: View {
     @Environment(SessionManager.self) private var session
+    @Environment(SyncEngine.self) private var syncEngine
     @State private var isLoggingOut = false
 
     var body: some View {
@@ -24,6 +25,37 @@ struct SettingsSheet: View {
                     }
                 }
 
+                Section("Sync") {
+                    HStack {
+                        Text("Last synced")
+                            .font(DS.Font.body)
+                            .foregroundStyle(DS.Color.textPrimary)
+                        Spacer()
+                        Text(lastSyncedLabel)
+                            .font(DS.Font.caption)
+                            .foregroundStyle(DS.Color.textSecondary)
+                    }
+                    if let error = syncEngine.lastSyncError {
+                        Text(error)
+                            .font(DS.Font.caption)
+                            .foregroundStyle(DS.Color.destructive)
+                            .lineLimit(3)
+                    }
+                    Button {
+                        Task { await syncEngine.syncAll() }
+                    } label: {
+                        HStack {
+                            Text("Sync Now")
+                                .font(DS.Font.body)
+                            if syncEngine.isSyncing {
+                                Spacer()
+                                ProgressView()
+                            }
+                        }
+                    }
+                    .disabled(syncEngine.isSyncing)
+                }
+
                 Section {
                     Button(role: .destructive) {
                         isLoggingOut = true
@@ -41,5 +73,10 @@ struct SettingsSheet: View {
             }
             .navigationTitle("Settings")
         }
+    }
+
+    private var lastSyncedLabel: String {
+        guard let at = syncEngine.lastSyncedAt else { return "Never" }
+        return at.formatted(.relative(presentation: .named))
     }
 }
