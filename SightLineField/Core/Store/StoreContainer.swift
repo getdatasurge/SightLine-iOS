@@ -9,6 +9,8 @@ enum StoreContainer {
             WorkType.self,
             WorkLog.self,
             Surface.self,
+            Building.self,
+            Elevation.self,
             SyncOutbox.self,
         ])
         let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: inMemory)

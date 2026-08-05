@@ -103,13 +103,32 @@ final class Surface {
     var jobId: String
     var label: String
     var status: String
+    /// M5a: the building/elevation/room a synced pane has been placed onto, if any — mirrors
+    /// the widened `GET /jobs/{id}/surfaces` projection (`SurfaceDTO`). All three are
+    /// independently optional: a pane can be unassigned, assigned to a building/elevation only,
+    /// grouped into a flat `Room` only, or (in principle) both.
+    var buildingId: String?
+    var elevationId: String?
+    var roomId: String?
     var updatedAt: Date
 
-    init(id: String, jobId: String, label: String, status: String, updatedAt: Date) {
+    init(
+        id: String,
+        jobId: String,
+        label: String,
+        status: String,
+        buildingId: String? = nil,
+        elevationId: String? = nil,
+        roomId: String? = nil,
+        updatedAt: Date
+    ) {
         self.id = id
         self.jobId = jobId
         self.label = label
         self.status = status
+        self.buildingId = buildingId
+        self.elevationId = elevationId
+        self.roomId = roomId
         self.updatedAt = updatedAt
     }
 }

@@ -8,6 +8,10 @@ final class StubSyncBackend: SyncBackend, @unchecked Sendable {
     var workTypesResult: Result<[WorkTypeDTO], Error> = .success([])
     var workLogsResult: Result<[WorkLogDTO], Error> = .success([])
     var surfacesResult: Result<[SurfaceRecord], Error> = .success([])
+    /// Applied uniformly to every `jobId` this stub is asked about — mirrors `surfacesResult`'s
+    /// single-shared-result shape (M5a's `SurveySyncTests.swift` seeds exactly one local job per
+    /// scenario needing this; per-job-varying results weren't needed by any caller yet).
+    var buildingsResult: Result<[BuildingDTO], Error> = .success([])
 
     /// Artificial delay inside `fetchJobs`, used to widen the overlap window for the
     /// reentrancy test.
@@ -18,6 +22,7 @@ final class StubSyncBackend: SyncBackend, @unchecked Sendable {
     private(set) var workTypesSinceCalls: [Date?] = []
     private(set) var workLogsSinceCalls: [Date?] = []
     private(set) var surfacesSinceCalls: [Date?] = []
+    private(set) var buildingsCalls: [(jobId: String, since: Date?)] = []
 
     func fetchJobs(since: Date?) async throws -> [JobDTO] {
         jobsSinceCalls.append(since)
@@ -45,6 +50,11 @@ final class StubSyncBackend: SyncBackend, @unchecked Sendable {
     func fetchSurfaces(since: Date?) async throws -> [SurfaceRecord] {
         surfacesSinceCalls.append(since)
         return try surfacesResult.get()
+    }
+
+    func fetchBuildings(jobId: String, since: Date?) async throws -> [BuildingDTO] {
+        buildingsCalls.append((jobId: jobId, since: since))
+        return try buildingsResult.get()
     }
 }
 

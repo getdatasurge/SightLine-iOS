@@ -3,7 +3,7 @@ import OpenAPIRuntime
 
 // MARK: - DTOs
 
-/// Lean, `Sendable` wire projections of the five M2 sync collections `SyncEngine` pulls into
+/// Lean, `Sendable` wire projections of the six M2/M5a sync collections `SyncEngine` pulls into
 /// SwiftData. Fields are a subset of what the API actually returns — e.g. `JobDTO` carries no
 /// price fields (`/jobs` is price-blind) — trimmed to what the local store persists.
 struct JobDTO: Decodable, Equatable, Sendable {
@@ -79,12 +79,18 @@ struct WorkLogDTO: Decodable, Equatable, Sendable {
 
 /// No `jobId` — a `Surface` isn't a direct child of `Job` server-side, so `/jobs/{id}/surfaces`
 /// items don't carry one. `LiveSyncBackend.fetchSurfaces` already knows it from the path it just
-/// called and attaches it via `SurfaceRecord`.
+/// called and attaches it via `SurfaceRecord`. `buildingId`/`elevationId`/`roomId` (M5a) are the
+/// widened projection's placement links — all three independently optional, `nil` for an
+/// unplaced pane; not persisted-through for anything beyond `Surface`'s own matching columns
+/// (no local `Building`/`Elevation`/`Room` back-reference is derived from them this slice).
 struct SurfaceDTO: Decodable, Equatable, Sendable {
     let id: String
     let label: String
     let status: String
     let notes: String?
+    let buildingId: String?
+    let elevationId: String?
+    let roomId: String?
     let updatedAt: Date
 }
 
@@ -93,6 +99,36 @@ struct SurfaceDTO: Decodable, Equatable, Sendable {
 struct SurfaceRecord: Equatable, Sendable {
     let jobId: String
     let surface: SurfaceDTO
+}
+
+/// One face of a `BuildingDTO`, nested under its parent's `elevations` array — see
+/// `BuildingDTO`'s doc comment for why the tree arrives nested instead of as a sibling
+/// collection. Field list per `.superpowers/sdd/m5a-backend-report.md` /
+/// `.superpowers/m5-survey-scout.md` §1.
+struct ElevationDTO: Decodable, Equatable, Sendable {
+    let id: String
+    let buildingId: String
+    let elevationNumber: Int
+    let numberLabel: String?
+    let label: String
+    let bearing: Int?
+    let facing: String?
+    let fieldAdded: Bool
+    let updatedAt: Date
+}
+
+/// A job's survey building, with its elevations nested inline (`GET /jobs/{id}/buildings`
+/// returns `{data: [{...building, elevations: [...]}]}` — a matched building always carries
+/// ALL its elevations, never a partial list, per the route's own `updatedAfter` semantics). No
+/// `jobId` for the same reason `SurfaceDTO` has none: `/jobs/{id}/buildings` is path-scoped, and
+/// `LiveSyncBackend.fetchBuildings` already knows the id of the job it just called for.
+struct BuildingDTO: Decodable, Equatable, Sendable {
+    let id: String
+    let name: String
+    let buildingIndex: Int
+    let notes: String?
+    let updatedAt: Date
+    let elevations: [ElevationDTO]
 }
 
 // MARK: - SyncBackend
@@ -108,11 +144,16 @@ protocol SyncBackend: Sendable {
     func fetchWorkTypes(since: Date?) async throws -> [WorkTypeDTO]
     func fetchWorkLogs(since: Date?) async throws -> [WorkLogDTO]
     func fetchSurfaces(since: Date?) async throws -> [SurfaceRecord]
+    /// Buildings nest under one specific job (`/jobs/{id}/buildings`) — unlike the other four
+    /// collections' `since`-only signature, this takes an explicit `jobId` instead of
+    /// enumerating jobs itself; `SyncEngine.syncBuildings()` owns that loop (see its doc
+    /// comment for why).
+    func fetchBuildings(jobId: String, since: Date?) async throws -> [BuildingDTO]
 }
 
 // MARK: - LiveSyncBackend
 
-/// Wraps the generated `Client` for the five M2 read collections.
+/// Wraps the generated `Client` for the M2 read collections plus M5a's per-job buildings tree.
 ///
 /// - `jobs`/`workTypes`/`workLogs` are business-wide: `/jobs` has no `technicianId` filter at
 ///   all, and `/work-logs`, though it has one, is deliberately left unfiltered — a technician
@@ -251,6 +292,41 @@ struct LiveSyncBackend: SyncBackend {
             }
         }
         return surfaces
+    }
+
+    /// SEAM — not yet compilable as of this commit: `Operations
+    /// .get_sol_jobs_sol__lcub_id_rcub__sol_buildings` doesn't exist in the generated client yet
+    /// (the checked-in `openapi.json` snapshot already has `GET /jobs/{id}/buildings`; the
+    /// DerivedData `Client`/`Types` predate it — regenerated during integration). Naming derived
+    /// from the exact convention every other operation in this file already uses (method +
+    /// `_sol_`-for-`/`, `_lcub_id_rcub_`-for-`{id}`): mirrors `fetchSurfaces`'s single-job-call
+    /// body verbatim, minus the job-enumeration loop — `jobId` arrives as a parameter here
+    /// instead (see the protocol requirement's doc comment for why), and the buildings tree is
+    /// documented "flat and unpaginated" so there's no cursor to drive either.
+    func fetchBuildings(jobId: String, since: Date?) async throws -> [BuildingDTO] {
+        let input = Operations.get_sol_jobs_sol__lcub_id_rcub__sol_buildings.Input(
+            path: .init(id: jobId),
+            query: .init(updatedAfter: since)
+        )
+        let output: Operations.get_sol_jobs_sol__lcub_id_rcub__sol_buildings.Output
+        do {
+            output = try await client.get_sol_jobs_sol__lcub_id_rcub__sol_buildings(input)
+        } catch {
+            throw ApiError.network(error)
+        }
+        switch output {
+        case .ok(let ok):
+            let payload = try ok.body.json
+            return try payload.data.map { try decode($0.additionalProperties, as: BuildingDTO.self) }
+        case .badRequest: throw ApiError.server(status: 400)
+        case .unauthorized: throw ApiError.unauthorized
+        case .forbidden: throw ApiError.server(status: 403)
+        case .notFound: throw ApiError.server(status: 404)
+        case .conflict: throw ApiError.server(status: 409)
+        case .tooManyRequests: throw ApiError.server(status: 429)
+        case .internalServerError: throw ApiError.server(status: 500)
+        case .undocumented(let statusCode, _): throw ApiError.server(status: statusCode)
+        }
     }
 
     // MARK: - Job enumeration (shared by fetchJobs and fetchSurfaces)

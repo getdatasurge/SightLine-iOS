@@ -3,10 +3,10 @@ import Observation
 import SwiftData
 import os
 
-/// Pulls the five M2 collections into SwiftData: per collection, decide full-vs-delta from its
-/// watermark (`SyncPlanner.decide`), fetch, upsert newest-wins (`SyncPlanner.planUpserts`), save,
-/// then advance the watermark (`SyncPlanner.advance`) — only on success, so a failed collection
-/// is retried from the same point next time.
+/// Pulls the six M2/M5a collections into SwiftData: per collection, decide full-vs-delta from
+/// its watermark (`SyncPlanner.decide`), fetch, upsert newest-wins (`SyncPlanner.planUpserts`),
+/// save, then advance the watermark (`SyncPlanner.advance`) — only on success, so a failed
+/// collection is retried from the same point next time.
 @Observable
 @MainActor
 final class SyncEngine {
@@ -28,7 +28,7 @@ final class SyncEngine {
         self.watermarks = watermarks
     }
 
-    /// Syncs all five collections in turn. A collection's failure is recorded in
+    /// Syncs all six collections in turn. A collection's failure is recorded in
     /// `lastSyncError` (collection name + underlying error) but doesn't stop the rest — a
     /// technician who's, say, rate-limited on work-logs should still get their job list
     /// refreshed. `lastSyncedAt` advances to now if *any* collection completed; `lastSyncError`
@@ -66,6 +66,7 @@ final class SyncEngine {
         case .workTypes: try await syncWorkTypes()
         case .workLogs: try await syncWorkLogs()
         case .surfaces: try await syncSurfaces()
+        case .buildings: try await syncBuildings()
         }
     }
 
@@ -289,15 +290,126 @@ final class SyncEngine {
                 model.jobId = dto.jobId
                 model.label = dto.surface.label
                 model.status = dto.surface.status
+                model.buildingId = dto.surface.buildingId
+                model.elevationId = dto.surface.elevationId
+                model.roomId = dto.surface.roomId
                 model.updatedAt = dto.surface.updatedAt
             } else {
-                modelContext.insert(Surface(id: dto.surface.id, jobId: dto.jobId, label: dto.surface.label, status: dto.surface.status, updatedAt: dto.surface.updatedAt))
+                modelContext.insert(
+                    Surface(
+                        id: dto.surface.id,
+                        jobId: dto.jobId,
+                        label: dto.surface.label,
+                        status: dto.surface.status,
+                        buildingId: dto.surface.buildingId,
+                        elevationId: dto.surface.elevationId,
+                        roomId: dto.surface.roomId,
+                        updatedAt: dto.surface.updatedAt
+                    )
+                )
             }
         }
         try modelContext.save()
 
         if let advanced = SyncPlanner.advance(current: watermark, seen: dtos.map { $0.surface.updatedAt }) {
             watermarks.set(.surfaces, to: advanced)
+        }
+    }
+
+    /// Buildings nest under one specific job, so unlike the other five collections this can't
+    /// just call one `backend.fetchX(since:)` and be done — `fetchBuildings` takes an explicit
+    /// `jobId` (see its protocol doc comment). Job ids come from the local store's own
+    /// `JobSummary` rows rather than a second live "list every job" network call: `.jobs`
+    /// always runs before `.buildings` in `SyncCollection.allCases`, so by the time this runs,
+    /// every job this device knows about is already present locally (from this pass or an
+    /// earlier one). Each building's tree arrives with its elevations nested
+    /// (`BuildingDTO.elevations`); both are flattened and upserted as two independent
+    /// newest-wins passes (mirroring every other `syncX`'s dedup/upsert shape exactly), sharing
+    /// one `buildings` watermark advanced from every row — building or elevation — actually
+    /// seen this pass.
+    private func syncBuildings() async throws {
+        let watermark = watermarks.get(.buildings)
+        let since = SyncPlanner.decide(watermark: watermark).since
+
+        let jobIds = try modelContext.fetch(FetchDescriptor<JobSummary>()).map(\.id)
+        var buildingDTOs: [(jobId: String, building: BuildingDTO)] = []
+        for jobId in jobIds {
+            let dtos = try await backend.fetchBuildings(jobId: jobId, since: since)
+            buildingDTOs += dtos.map { (jobId, $0) }
+        }
+        guard !buildingDTOs.isEmpty else { return }
+
+        let buildingIds = Set(buildingDTOs.map { $0.building.id })
+        let existingBuildings = try modelContext.fetch(FetchDescriptor<Building>(predicate: #Predicate { buildingIds.contains($0.id) }))
+        let existingBuildingsById = Dictionary(uniqueKeysWithValues: existingBuildings.map { ($0.id, $0) })
+        // See `syncJobs`'s `dtoById` comment: mirrors `planUpserts`'s newest-wins tie-break.
+        let buildingByRecordId = Dictionary(
+            buildingDTOs.map { ($0.building.id, $0) },
+            uniquingKeysWith: { current, new in current.building.updatedAt >= new.building.updatedAt ? current : new }
+        )
+
+        let buildingPlans = SyncPlanner.planUpserts(
+            incoming: buildingDTOs.map { SyncRecord(id: $0.building.id, updatedAt: $0.building.updatedAt) },
+            existingIds: Set(existingBuildingsById.keys)
+        )
+        for plan in buildingPlans {
+            guard let entry = buildingByRecordId[plan.record.id] else { continue }
+            let dto = entry.building
+            if let model = existingBuildingsById[plan.record.id] {
+                model.jobId = entry.jobId
+                model.name = dto.name
+                model.buildingIndex = dto.buildingIndex
+                model.notes = dto.notes
+                model.updatedAt = dto.updatedAt
+            } else {
+                modelContext.insert(
+                    Building(id: dto.id, jobId: entry.jobId, name: dto.name, buildingIndex: dto.buildingIndex, notes: dto.notes, updatedAt: dto.updatedAt)
+                )
+            }
+        }
+
+        let elevationDTOs = buildingDTOs.flatMap(\.building.elevations)
+        let elevationIds = Set(elevationDTOs.map(\.id))
+        let existingElevations = try modelContext.fetch(FetchDescriptor<Elevation>(predicate: #Predicate { elevationIds.contains($0.id) }))
+        let existingElevationsById = Dictionary(uniqueKeysWithValues: existingElevations.map { ($0.id, $0) })
+        let elevationById = Dictionary(elevationDTOs.map { ($0.id, $0) }, uniquingKeysWith: { current, new in current.updatedAt >= new.updatedAt ? current : new })
+
+        let elevationPlans = SyncPlanner.planUpserts(
+            incoming: elevationDTOs.map { SyncRecord(id: $0.id, updatedAt: $0.updatedAt) },
+            existingIds: Set(existingElevationsById.keys)
+        )
+        for plan in elevationPlans {
+            guard let dto = elevationById[plan.record.id] else { continue }
+            if let model = existingElevationsById[plan.record.id] {
+                model.buildingId = dto.buildingId
+                model.elevationNumber = dto.elevationNumber
+                model.numberLabel = dto.numberLabel
+                model.label = dto.label
+                model.bearing = dto.bearing
+                model.facing = dto.facing
+                model.fieldAdded = dto.fieldAdded
+                model.updatedAt = dto.updatedAt
+            } else {
+                modelContext.insert(
+                    Elevation(
+                        id: dto.id,
+                        buildingId: dto.buildingId,
+                        elevationNumber: dto.elevationNumber,
+                        numberLabel: dto.numberLabel,
+                        label: dto.label,
+                        bearing: dto.bearing,
+                        facing: dto.facing,
+                        fieldAdded: dto.fieldAdded,
+                        updatedAt: dto.updatedAt
+                    )
+                )
+            }
+        }
+        try modelContext.save()
+
+        let seenUpdatedAts = buildingDTOs.map(\.building.updatedAt) + elevationDTOs.map(\.updatedAt)
+        if let advanced = SyncPlanner.advance(current: watermark, seen: seenUpdatedAts) {
+            watermarks.set(.buildings, to: advanced)
         }
     }
 }

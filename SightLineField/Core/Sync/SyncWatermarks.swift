@@ -7,6 +7,7 @@ enum SyncCollection: String, CaseIterable {
     case workTypes
     case workLogs
     case surfaces
+    case buildings
 }
 
 /// Per-collection "last synced through" timestamps, persisted in `UserDefaults`.
