@@ -16,6 +16,8 @@ struct RootView: View {
                     .tabItem { Label("Jobs", systemImage: "list.bullet") }
                 WorkLogsView()
                     .tabItem { Label("Work Logs", systemImage: "clock") }
+                SettingsSheet()
+                    .tabItem { Label("Settings", systemImage: "gearshape") }
             }
             .tint(DS.Color.accent)
         }
