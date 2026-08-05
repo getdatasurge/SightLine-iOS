@@ -4,6 +4,7 @@ import SwiftUI
 struct SettingsSheet: View {
     @Environment(SessionManager.self) private var session
     @Environment(SyncEngine.self) private var syncEngine
+    @Environment(OutboxWorker.self) private var outbox
     @State private var isLoggingOut = false
 
     var body: some View {
@@ -54,6 +55,22 @@ struct SettingsSheet: View {
                         }
                     }
                     .disabled(syncEngine.isSyncing)
+                    if outbox.pendingCount > 0 {
+                        HStack {
+                            Text("Pending uploads")
+                                .font(DS.Font.body)
+                                .foregroundStyle(DS.Color.textPrimary)
+                            Spacer()
+                            Text("\(outbox.pendingCount)")
+                                .font(DS.Font.caption)
+                                .foregroundStyle(DS.Color.textSecondary)
+                        }
+                    }
+                    if outbox.conflictCount > 0 {
+                        Text("\(outbox.conflictCount) need attention")
+                            .font(DS.Font.caption)
+                            .foregroundStyle(DS.Color.destructive)
+                    }
                 }
 
                 Section {
