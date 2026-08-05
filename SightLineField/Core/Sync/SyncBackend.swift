@@ -14,7 +14,10 @@ struct JobDTO: Decodable, Equatable, Sendable {
     }
 
     let id: String
-    let title: String
+    /// `Job.title` is nullable server-side (`string | null`); `number` (always present) is the
+    /// display fallback so a titleless job can't fail the whole collection's decode.
+    let title: String?
+    let number: String
     let status: String
     let customer: Customer?
     let updatedAt: Date

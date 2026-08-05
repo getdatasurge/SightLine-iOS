@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import SwiftData
+import os
 
 /// Pulls the five M2 collections into SwiftData: per collection, decide full-vs-delta from its
 /// watermark (`SyncPlanner.decide`), fetch, upsert newest-wins (`SyncPlanner.planUpserts`), save,
@@ -16,6 +17,10 @@ final class SyncEngine {
     private let backend: SyncBackend
     private let modelContext: ModelContext
     private let watermarks: SyncWatermarks
+
+    /// Sync visibility in Console/log-stream — success/failure per collection is otherwise
+    /// invisible (no UI surfaces `lastSyncError` yet).
+    private static let log = Logger(subsystem: "com.getdatasurge.sightline.field", category: "sync")
 
     init(backend: SyncBackend, modelContext: ModelContext, watermarks: SyncWatermarks) {
         self.backend = backend
@@ -41,8 +46,10 @@ final class SyncEngine {
             do {
                 try await sync(collection)
                 succeededAny = true
+                Self.log.info("sync ok: \(collection.rawValue, privacy: .public)")
             } catch {
                 failureMessage = "\(collection.rawValue): \(error)"
+                Self.log.error("sync failed: \(collection.rawValue, privacy: .public) — \(String(describing: error), privacy: .public)")
             }
         }
 
@@ -87,12 +94,12 @@ final class SyncEngine {
         for plan in plans {
             guard let dto = dtoById[plan.record.id] else { continue }
             if let model = existingById[plan.record.id] {
-                model.name = dto.title
+                model.name = dto.title ?? dto.number
                 model.address = dto.customer?.name
                 model.status = dto.status
                 model.updatedAt = dto.updatedAt
             } else {
-                modelContext.insert(JobSummary(id: dto.id, name: dto.title, address: dto.customer?.name, status: dto.status, updatedAt: dto.updatedAt))
+                modelContext.insert(JobSummary(id: dto.id, name: dto.title ?? dto.number, address: dto.customer?.name, status: dto.status, updatedAt: dto.updatedAt))
             }
         }
         try modelContext.save()
