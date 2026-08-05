@@ -59,3 +59,19 @@ Writes (check-in/out, status advance, uploads) — M3. Outbox/conflicts/backgrou
 ## Definition of done (brief §9-M2)
 
 Seeded technician signs in on simulator → sees today's jobs and their surfaces; airplane-mode relaunch still shows them (offline-after-first-sync); no price visible for the Technician role; owner login sees full schedule + prices; both repos green (web: typecheck/lint/test + build; iOS: full suite incl. extended smoke); OpenAPI regenerated and committed in the same iOS change that consumes it.
+
+## Deviations
+
+- `GET /jobs`/`GET /jobs/{id}`: no `technicianId` param — business-wide list,
+  price-blind via route-adapter projection (not filtered by technician).
+- `GET /work-logs`: deliberately business-wide, not technician-scoped
+  (matches existing `listWorkLogs` semantics; filters are additive, not a
+  technician restriction).
+- `GET /work-types`: unpaginated, no filter params (small, mostly-static set).
+- `GET /appointments`: the only collection actually scoped by
+  `technicianId=me`.
+- Surface/Job `updateMany` paths weren't bumping `updatedAt`, breaking delta
+  sync; fixed backend-side in `bf1ddf8b`.
+- `AppointmentDTO`/`WorkLogDTO` carry `technicianId`, and `SurfaceDTO`
+  carries `notes` — decoded client-side but not persisted in M2 (no matching
+  SwiftData model columns yet).

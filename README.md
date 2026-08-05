@@ -36,3 +36,12 @@ In Debug builds the app defaults its API base URL to `http://localhost:3005`.
 Override it with the `-apiBaseURL <url>` launch argument (Xcode scheme
 "Arguments Passed On Launch", or `xcodebuild test`/`run` launch args) to point
 at a different host.
+
+## M2: read-only sync
+
+`SyncEngine` pulls jobs, appointments, work-types, work-logs, and surfaces,
+each with its own delta watermark (`updatedAt`-based; first run or invalid
+watermark falls back to a full paged pull). Pull-to-refresh on Schedule
+re-runs `syncAll()`. Identity (`technicianId`, capabilities) comes from
+`GET /technicians/me` at login/bootstrap. Sign-out wipes the local
+SwiftData cache.
