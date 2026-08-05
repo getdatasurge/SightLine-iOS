@@ -1,6 +1,7 @@
 import SwiftData
 import SwiftUI
 
+@MainActor
 struct JobDetailView: View {
     let job: JobSummary
 

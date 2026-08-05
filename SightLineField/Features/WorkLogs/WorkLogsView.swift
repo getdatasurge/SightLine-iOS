@@ -1,6 +1,7 @@
 import SwiftData
 import SwiftUI
 
+@MainActor
 struct WorkLogsView: View {
     @Query(sort: \WorkLog.checkInAt, order: .reverse) private var workLogs: [WorkLog]
 

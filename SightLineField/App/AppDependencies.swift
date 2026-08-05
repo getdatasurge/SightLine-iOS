@@ -26,6 +26,13 @@ final class AppDependencies {
 
     init(environment: AppEnvironment = .resolve(), inMemoryStore: Bool = false) {
         let tokenStore = KeychainTokenStore()
+
+        // UITest isolation: wipe any persisted session before wiring anything, so every
+        // UI-test launch starts signed out regardless of what a prior run left behind.
+        if ProcessInfo.processInfo.arguments.contains("-uitest-reset") {
+            tokenStore.clear()
+            UserDefaults.standard.removeObject(forKey: "accountContext")
+        }
         let refresherBox = SessionRefresherBox()
 
         let client = ApiClientFactory.make(environment: environment, tokenStore: tokenStore, refresher: refresherBox)

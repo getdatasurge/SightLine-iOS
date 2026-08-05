@@ -1,6 +1,7 @@
 import SwiftData
 import SwiftUI
 
+@MainActor
 struct ScheduleView: View {
     @Query(sort: \Appointment.start) private var appointments: [Appointment]
 
