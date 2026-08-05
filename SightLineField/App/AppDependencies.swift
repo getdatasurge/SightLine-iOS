@@ -64,4 +64,8 @@ private final class SessionRefresherBox: TokenRefresher, @unchecked Sendable {
         guard let session else { return false }
         return await session.refreshTokens()
     }
+
+    func sessionInvalidated() async {
+        await session?.sessionInvalidated()
+    }
 }
