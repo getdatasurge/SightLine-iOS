@@ -3,6 +3,7 @@ import SwiftUI
 @MainActor
 struct RootView: View {
     @Environment(SessionManager.self) private var session
+    @Environment(SyncEngine.self) private var syncEngine
 
     var body: some View {
         switch session.state {
@@ -20,6 +21,7 @@ struct RootView: View {
                     .tabItem { Label("Settings", systemImage: "gearshape") }
             }
             .tint(DS.Color.accent)
+            .task { await syncEngine.syncAll() }
         }
     }
 }

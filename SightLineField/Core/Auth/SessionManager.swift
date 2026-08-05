@@ -13,6 +13,11 @@ final class SessionManager: TokenRefresher {
     private(set) var state: State = .signedOut
     var lastError: ApiError?
 
+    /// Invoked by every sign-out path (`clearAll`) so the composition root can wipe local
+    /// caches (SwiftData rows + sync watermarks) that must not leak across accounts on a
+    /// shared installer device. Set once by `AppDependencies`; nil in tests.
+    var onSignedOut: (() -> Void)?
+
     private let gateway: AuthGateway
     private let tokenStore: TokenStore
     private let defaults: UserDefaults
@@ -154,5 +159,6 @@ final class SessionManager: TokenRefresher {
     private func clearAll() {
         tokenStore.clear()
         defaults.removeObject(forKey: Self.contextKey)
+        onSignedOut?()
     }
 }

@@ -23,6 +23,7 @@ import SwiftData
 final class AppDependencies {
     let session: SessionManager
     let modelContainer: ModelContainer
+    let syncEngine: SyncEngine
 
     init(environment: AppEnvironment = .resolve(), inMemoryStore: Bool = false) {
         let tokenStore = KeychainTokenStore()
@@ -41,13 +42,36 @@ final class AppDependencies {
         refresherBox.session = session
         self.session = session
 
+        let container: ModelContainer
         do {
-            modelContainer = try StoreContainer.make(inMemory: inMemoryStore)
+            container = try StoreContainer.make(inMemory: inMemoryStore)
         } catch {
             // A local SwiftData store failing to open (disk full, corrupt file, migration
             // failure) leaves the app with no usable data layer — nothing downstream can
             // recover from this, so fail fast rather than limp along without persistence.
             fatalError("Failed to create SwiftData ModelContainer: \(error)")
+        }
+        self.modelContainer = container
+
+        let watermarks = SyncWatermarks(defaults: .standard)
+        self.syncEngine = SyncEngine(
+            backend: LiveSyncBackend(client: client),
+            modelContext: container.mainContext,
+            watermarks: watermarks
+        )
+
+        // Every sign-out (explicit logout, expired bootstrap, 401 theft-signal) must leave no
+        // trace of the prior account on a shared installer device: drop the delta watermarks so
+        // the next sign-in does a full pull, and wipe the cached rows. Runs on the MainActor —
+        // `clearAll` is only ever reached from MainActor-isolated SessionManager methods.
+        session.onSignedOut = { [weak container] in
+            watermarks.clearAll()
+            guard let context = container?.mainContext else { return }
+            try? context.delete(model: JobSummary.self)
+            try? context.delete(model: Appointment.self)
+            try? context.delete(model: WorkType.self)
+            try? context.delete(model: WorkLog.self)
+            try? context.delete(model: Surface.self)
         }
     }
 }

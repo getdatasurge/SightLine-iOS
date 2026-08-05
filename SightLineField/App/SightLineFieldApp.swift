@@ -9,6 +9,7 @@ struct SightLineFieldApp: App {
         WindowGroup {
             RootView()
                 .environment(dependencies.session)
+                .environment(dependencies.syncEngine)
                 .modelContainer(dependencies.modelContainer)
                 .task { await dependencies.session.bootstrap() }
         }

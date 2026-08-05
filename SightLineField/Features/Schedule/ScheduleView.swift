@@ -4,6 +4,7 @@ import SwiftUI
 @MainActor
 struct ScheduleView: View {
     @Query(sort: \Appointment.start) private var appointments: [Appointment]
+    @Environment(SyncEngine.self) private var syncEngine
 
     /// Appointments grouped by calendar day, restricted to today and later, sorted
     /// chronologically (today first). Past appointments are dropped rather than shown in a
@@ -36,6 +37,7 @@ struct ScheduleView: View {
                 }
             }
             .navigationTitle("Schedule")
+            .refreshable { await syncEngine.syncAll() }
         }
     }
 }
