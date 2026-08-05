@@ -129,13 +129,15 @@ final class SyncOutbox {
     var attempts: Int
     var lastError: String?
     var state: String
+    var createdAt: Date
 
-    init(clientUuid: String, endpoint: String, payload: Data, attempts: Int = 0, lastError: String? = nil, state: String = OutboxState.pending.rawValue) {
+    init(clientUuid: String, endpoint: String, payload: Data, attempts: Int = 0, lastError: String? = nil, state: String = OutboxState.pending.rawValue, createdAt: Date = Date()) {
         self.clientUuid = clientUuid
         self.endpoint = endpoint
         self.payload = payload
         self.attempts = attempts
         self.lastError = lastError
         self.state = state
+        self.createdAt = createdAt
     }
 }
