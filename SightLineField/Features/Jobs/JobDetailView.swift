@@ -6,15 +6,44 @@ struct JobDetailView: View {
     let job: JobSummary
 
     @Query private var surfaces: [Surface]
+    @Query private var openWorkLogs: [WorkLog]
+
+    @State private var isCheckInPresented = false
+    @State private var checkOutTarget: WorkLog?
 
     init(job: JobSummary) {
         self.job = job
         let jobId = job.id
         _surfaces = Query(filter: #Predicate<Surface> { $0.jobId == jobId }, sort: [SortDescriptor(\.label)])
+        // Reactive equivalent of `WorkLogActions.openWorkLog(onJob:technicianId:)` — a `@Query`
+        // (not a one-shot fetch) so this view re-renders the moment `checkIn`/`checkOut` upserts
+        // a row, per the "@Query store-first" house style. See that method's doc comment for why
+        // this can't also filter by technician yet.
+        _openWorkLogs = Query(
+            filter: #Predicate<WorkLog> { $0.jobId == jobId && $0.status == "CHECKED_IN" },
+            sort: [SortDescriptor(\.checkInAt, order: .reverse)]
+        )
     }
+
+    /// The caller's own open session on this job, if any — mirrors `WorkLogActions
+    /// .openWorkLog(onJob:)`.
+    private var openWorkLog: WorkLog? { openWorkLogs.first }
 
     var body: some View {
         List {
+            Section {
+                if let openWorkLog {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Checked in since \(openWorkLog.checkInAt.formatted(date: .omitted, time: .shortened))")
+                            .font(DS.Font.caption)
+                            .foregroundStyle(DS.Color.textSecondary)
+                        Button("Check Out") { checkOutTarget = openWorkLog }
+                    }
+                } else {
+                    Button("Check In") { isCheckInPresented = true }
+                }
+            }
+
             Section("Job") {
                 LabeledContent("Name", value: job.name)
                 if let address = job.address {
@@ -45,6 +74,12 @@ struct JobDetailView: View {
             }
         }
         .navigationTitle(job.name)
+        .sheet(isPresented: $isCheckInPresented) {
+            CheckInSheet(jobId: job.id)
+        }
+        .sheet(item: $checkOutTarget) { workLog in
+            CheckOutSheet(workLog: workLog)
+        }
     }
 }
 
