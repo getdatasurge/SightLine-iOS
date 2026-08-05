@@ -7,6 +7,7 @@ import Observation
 /// dependency and is scratch-package buildable/testable on any platform (see
 /// `.superpowers/sdd/task-8-report.md`).
 @Observable
+@MainActor
 final class LoginViewModel {
     var email = ""
     var password = ""

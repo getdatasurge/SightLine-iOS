@@ -1,5 +1,6 @@
 import SwiftUI
 
+@MainActor
 struct LoginView: View {
     @Environment(SessionManager.self) private var session
     @State private var viewModel = LoginViewModel()

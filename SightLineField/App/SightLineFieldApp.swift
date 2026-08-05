@@ -1,6 +1,7 @@
 import SwiftUI
 
 @main
+@MainActor
 struct SightLineFieldApp: App {
     @State private var dependencies = AppDependencies()
 

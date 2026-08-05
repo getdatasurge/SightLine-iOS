@@ -1,5 +1,6 @@
 import SwiftUI
 
+@MainActor
 struct RootView: View {
     @Environment(SessionManager.self) private var session
 

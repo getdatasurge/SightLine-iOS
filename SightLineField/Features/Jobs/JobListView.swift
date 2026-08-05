@@ -1,6 +1,7 @@
 import SwiftData
 import SwiftUI
 
+@MainActor
 struct JobListView: View {
     @Query(sort: \JobSummary.updatedAt, order: .reverse) private var jobs: [JobSummary]
 

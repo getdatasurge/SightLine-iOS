@@ -10,8 +10,9 @@ schemes:
       targets:
         SightLineField: all
         SightLineFieldTests: [test]
+        SightLineFieldUITests: [test]
     test:
-      targets: [SightLineFieldTests]
+      targets: [SightLineFieldTests, SightLineFieldUITests]
 packages:
   OpenAPIRuntime:
     url: https://github.com/apple/swift-openapi-runtime
@@ -60,6 +61,15 @@ targets:
         product: OpenAPIRuntime
       - package: HTTPTypes
         product: HTTPTypes
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+  SightLineFieldUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [SightLineFieldUITests]
+    dependencies:
+      - target: SightLineField
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
