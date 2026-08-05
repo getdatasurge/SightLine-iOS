@@ -234,4 +234,47 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(decoded.technicianId, "tech-9")
         XCTAssertEqual(decoded.capabilities, ["jobs:read", "jobs:write"])
     }
+
+    func testLogoutFiresOnSignedOutExactlyOnce() async throws {
+        let store = InMemoryTokenStore()
+        let gw = StubAuthGateway(loginResult: .success((TokenPair(accessToken: "a", refreshToken: "r"), ctx())))
+        let sm = SessionManager(gateway: gw, tokenStore: store, defaults: freshDefaults())
+        var callCount = 0
+        sm.onSignedOut = { callCount += 1 }
+        await sm.login(email: "t@x.com", password: "pw")
+        await sm.logout()
+        XCTAssertEqual(callCount, 1)
+    }
+
+    func testSessionInvalidatedFiresOnSignedOut() async throws {
+        let store = InMemoryTokenStore()
+        let gw = StubAuthGateway(loginResult: .success((TokenPair(accessToken: "a", refreshToken: "r"), ctx())))
+        let sm = SessionManager(gateway: gw, tokenStore: store, defaults: freshDefaults())
+        var callCount = 0
+        sm.onSignedOut = { callCount += 1 }
+        await sm.login(email: "t@x.com", password: "pw")
+        await sm.sessionInvalidated()
+        XCTAssertEqual(callCount, 1)
+    }
+
+    func testSuccessfulLoginDoesNotFireOnSignedOut() async throws {
+        let store = InMemoryTokenStore()
+        let gw = StubAuthGateway(loginResult: .success((TokenPair(accessToken: "a", refreshToken: "r"), ctx())))
+        let sm = SessionManager(gateway: gw, tokenStore: store, defaults: freshDefaults())
+        var callCount = 0
+        sm.onSignedOut = { callCount += 1 }
+        await sm.login(email: "t@x.com", password: "pw")
+        XCTAssertEqual(sm.state, .signedIn(ctx()))
+        XCTAssertEqual(callCount, 0)
+    }
+
+    func testBootstrapWithoutPersistedContextFiresOnSignedOut() async throws {
+        let store = InMemoryTokenStore()
+        try store.save(TokenPair(accessToken: "a", refreshToken: "r"))
+        let sm = SessionManager(gateway: StubAuthGateway(), tokenStore: store, defaults: freshDefaults())
+        var callCount = 0
+        sm.onSignedOut = { callCount += 1 }
+        await sm.bootstrap()
+        XCTAssertEqual(callCount, 1)
+    }
 }
