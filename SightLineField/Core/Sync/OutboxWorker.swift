@@ -23,12 +23,34 @@ struct CheckOutPayload: Codable, Sendable, Equatable {
     let notes: String?
 }
 
-/// The two operations a `SyncOutbox` row can target. Raw values are what `WorkLogActions`
-/// stores verbatim in `SyncOutbox.endpoint`; `OutboxWorker.drain()` dispatches on them to pick
-/// both the payload type to decode and the `WorkLogGateway` method to replay.
+/// Wire payload for a queued `POST /uploads` replay (M4b) — the picked image's bytes travel
+/// inside the `SyncOutbox` row itself (`Data`'s default `Codable` encoding, base64 on the wire)
+/// rather than a file-system reference, so a queued photo survives even if whatever produced
+/// `imageData` (e.g. a `PhotosPickerItem`'s transferable load) is long gone by the time
+/// `drain()` actually replays it. `filename`/`mimeType` are minted once at enqueue time
+/// (`PhotoActions.enqueuePhoto`), not re-derived per attempt, so a retry after a transient
+/// failure sends byte-for-byte the same multipart part every time.
+struct PhotoUploadPayload: Codable, Sendable, Equatable {
+    let entityType: String
+    let entityId: String
+    let filename: String
+    let mimeType: String
+    let imageData: Data
+}
+
+/// The operations a `SyncOutbox` row can target. Raw values are what `WorkLogActions`/
+/// `PhotoActions` store verbatim in `SyncOutbox.endpoint`; `OutboxWorker.drain()` dispatches on
+/// them to pick both the payload type to decode and where to replay: `WorkLogGateway` for the
+/// first two, `OutboxWorker.photoGateway` for the third (M4b).
 enum OutboxEndpoint: String, Sendable {
     case checkIn = "work-logs/check-in"
     case checkOut = "work-logs/check-out"
+    /// `POST /uploads` (M4b, append-only photo capture). Unlike check-in/check-out, this route
+    /// has no client-supplied idempotency key, so a replay after this device sent the request
+    /// but never saw the response could upload the same photo twice server-side — accepted for
+    /// M4b (matches the spec's "at-least-once" outbox model; no worse than any other endpoint
+    /// replaying after a lost response), flagged here rather than silently assumed exactly-once.
+    case photoUpload = "uploads"
 }
 
 // MARK: - OutboxWorker
@@ -63,6 +85,16 @@ final class OutboxWorker {
     private let gateway: WorkLogGateway
     private let modelContext: ModelContext
     private let maxAttempts = 6
+
+    /// Additive dependency for M4b (photo outbox) — deliberately not an `init` parameter, so
+    /// `WorkLogActions`'s existing `OutboxWorker(gateway:modelContext:)` call site (and every
+    /// existing test) keeps compiling unchanged. `nil` until the composition root
+    /// (`AppDependencies`) sets it post-construction; `attempt()` treats a `.photoUpload` row
+    /// with no gateway wired as a transient, non-pass-stopping failure rather than crashing, so
+    /// a photo enqueued before wiring happens — or a test/preview `OutboxWorker` that never
+    /// wires one at all — just stays queued instead of taking down the whole drain pass (or
+    /// blocking unrelated check-in/check-out rows behind it).
+    var photoGateway: PhotoUploadGateway?
 
     init(gateway: WorkLogGateway, modelContext: ModelContext) {
         self.gateway = gateway
@@ -175,6 +207,22 @@ final class OutboxWorker {
             do {
                 let dto = try await gateway.checkOut(workLogClientUuid: payload.workLogClientUuid, quantity: payload.quantity, notes: payload.notes)
                 reconcile(dto, clientUuid: payload.workLogClientUuid)
+                return .success
+            } catch {
+                return classify(error)
+            }
+        case .photoUpload:
+            guard let payload = try? JSONDecoder().decode(PhotoUploadPayload.self, from: item.payload) else {
+                return .permanentFailure("undecodable photo-upload payload")
+            }
+            guard let photoGateway else {
+                return .transientFailure("photo upload gateway not configured", stopsPass: false)
+            }
+            do {
+                try await photoGateway.upload(
+                    entityType: payload.entityType, entityId: payload.entityId,
+                    imageData: payload.imageData, filename: payload.filename, mimeType: payload.mimeType
+                )
                 return .success
             } catch {
                 return classify(error)
