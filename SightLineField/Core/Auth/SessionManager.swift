@@ -35,6 +35,7 @@ final class SessionManager: TokenRefresher {
             return
         }
         state = .signedIn(context)
+        await applyIdentity(to: context)
     }
 
     func login(email: String, password: String) async {
@@ -45,6 +46,7 @@ final class SessionManager: TokenRefresher {
             try tokenStore.save(pair)
             persist(context)
             state = .signedIn(context)
+            await applyIdentity(to: context)
         } catch {
             clearAll()
             state = .signedOut
@@ -121,6 +123,25 @@ final class SessionManager: TokenRefresher {
     private func persist(_ context: AccountContext) {
         guard let data = try? JSONEncoder().encode(context) else { return }
         defaults.set(data, forKey: Self.contextKey)
+    }
+
+    /// Bootstraps `technicianId`/`capabilities` from `GET /technicians/me` after a
+    /// successful `login()` or a `bootstrap()` that restored a valid session. Best-effort:
+    /// a throw (offline, 401, decoding, ...) leaves the caller's already-set `signedIn`
+    /// state exactly as it was — no error surfaced, no state change — since identity is an
+    /// enrichment, not a precondition for being signed in.
+    private func applyIdentity(to context: AccountContext) async {
+        guard let identity = try? await gateway.fetchIdentity() else { return }
+        let merged = AccountContext(
+            accountId: context.accountId,
+            email: context.email,
+            businessId: context.businessId,
+            sessionId: context.sessionId,
+            technicianId: identity.technicianId,
+            capabilities: identity.capabilities
+        )
+        persist(merged)
+        state = .signedIn(merged)
     }
 
     private func loadPersistedContext() -> AccountContext? {

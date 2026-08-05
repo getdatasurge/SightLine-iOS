@@ -5,19 +5,23 @@ final class StubAuthGateway: AuthGateway, @unchecked Sendable {
     var loginResult: Result<(TokenPair, AccountContext), Error>
     var refreshResult: Result<TokenPair, Error>
     var logoutThrows: Bool
+    var fetchIdentityResult: Result<Identity, Error>
     var refreshDelayNanoseconds: UInt64 = 0
     private(set) var logoutCallCount = 0
     private(set) var lastLogoutSessionId: String?
     private(set) var refreshCallCount = 0
+    private(set) var fetchIdentityCallCount = 0
 
     init(
         loginResult: Result<(TokenPair, AccountContext), Error> = .failure(ApiError.unauthorized),
         refreshResult: Result<TokenPair, Error> = .failure(ApiError.unauthorized),
-        logoutThrows: Bool = false
+        logoutThrows: Bool = false,
+        fetchIdentityResult: Result<Identity, Error> = .success(Identity(technicianId: nil, capabilities: []))
     ) {
         self.loginResult = loginResult
         self.refreshResult = refreshResult
         self.logoutThrows = logoutThrows
+        self.fetchIdentityResult = fetchIdentityResult
     }
 
     func login(email: String, password: String, device: DeviceInfo) async throws -> (TokenPair, AccountContext) {
@@ -38,6 +42,11 @@ final class StubAuthGateway: AuthGateway, @unchecked Sendable {
         // recorded here only for test observability, not control flow.
         logoutCallCount += 1
         lastLogoutSessionId = sessionId
+    }
+
+    func fetchIdentity() async throws -> Identity {
+        fetchIdentityCallCount += 1
+        return try fetchIdentityResult.get()
     }
 }
 
@@ -170,5 +179,59 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertNil(store.load())
         XCTAssertEqual(sm.state, .signedOut)
         XCTAssertNil(defaults.data(forKey: "accountContext"))
+    }
+
+    func testLoginMergesIdentityFromFetchIdentity() async throws {
+        let store = InMemoryTokenStore()
+        let identity = Identity(technicianId: "tech-1", capabilities: ["jobs:read"])
+        let gw = StubAuthGateway(
+            loginResult: .success((TokenPair(accessToken: "a", refreshToken: "r"), ctx())),
+            fetchIdentityResult: .success(identity)
+        )
+        let defaults = freshDefaults()
+        let sm = SessionManager(gateway: gw, tokenStore: store, defaults: defaults)
+        await sm.login(email: "t@x.com", password: "pw")
+        let expected = AccountContext(accountId: "a1", email: "t@x.com", businessId: "b1", sessionId: "s1",
+                                       technicianId: "tech-1", capabilities: ["jobs:read"])
+        XCTAssertEqual(sm.state, .signedIn(expected))
+        XCTAssertEqual(gw.fetchIdentityCallCount, 1)
+        let persisted = try JSONDecoder().decode(AccountContext.self, from: try XCTUnwrap(defaults.data(forKey: "accountContext")))
+        XCTAssertEqual(persisted, expected)
+    }
+
+    func testBootstrapMergesIdentityFromFetchIdentity() async throws {
+        let store = InMemoryTokenStore()
+        try store.save(TokenPair(accessToken: "a", refreshToken: "r"))
+        let defaults = freshDefaults()
+        defaults.set(try JSONEncoder().encode(ctx()), forKey: "accountContext")
+        let identity = Identity(technicianId: "tech-2", capabilities: ["jobs:read", "jobs:write"])
+        let gw = StubAuthGateway(fetchIdentityResult: .success(identity))
+        let sm = SessionManager(gateway: gw, tokenStore: store, defaults: defaults)
+        await sm.bootstrap()
+        let expected = AccountContext(accountId: "a1", email: "t@x.com", businessId: "b1", sessionId: "s1",
+                                       technicianId: "tech-2", capabilities: ["jobs:read", "jobs:write"])
+        XCTAssertEqual(sm.state, .signedIn(expected))
+    }
+
+    func testIdentityFetchFailureLeavesSignedInUnchanged() async throws {
+        let store = InMemoryTokenStore()
+        let gw = StubAuthGateway(
+            loginResult: .success((TokenPair(accessToken: "a", refreshToken: "r"), ctx())),
+            fetchIdentityResult: .failure(ApiError.network(URLError(.notConnectedToInternet)))
+        )
+        let sm = SessionManager(gateway: gw, tokenStore: store, defaults: freshDefaults())
+        await sm.login(email: "t@x.com", password: "pw")
+        XCTAssertEqual(sm.state, .signedIn(ctx()))
+        XCTAssertEqual(gw.fetchIdentityCallCount, 1)
+    }
+
+    func testPersistedContextRoundTripsTechnicianIdAndCapabilities() throws {
+        let context = AccountContext(accountId: "a1", email: "t@x.com", businessId: "b1", sessionId: "s1",
+                                      technicianId: "tech-9", capabilities: ["jobs:read", "jobs:write"])
+        let data = try JSONEncoder().encode(context)
+        let decoded = try JSONDecoder().decode(AccountContext.self, from: data)
+        XCTAssertEqual(decoded, context)
+        XCTAssertEqual(decoded.technicianId, "tech-9")
+        XCTAssertEqual(decoded.capabilities, ["jobs:read", "jobs:write"])
     }
 }
