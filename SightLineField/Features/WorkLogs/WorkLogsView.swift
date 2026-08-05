@@ -4,6 +4,7 @@ import SwiftUI
 @MainActor
 struct WorkLogsView: View {
     @Query(sort: \WorkLog.checkInAt, order: .reverse) private var workLogs: [WorkLog]
+    @Environment(SyncEngine.self) private var syncEngine
 
     var body: some View {
         NavigationStack {
@@ -17,6 +18,7 @@ struct WorkLogsView: View {
                 }
             }
             .navigationTitle("Work Logs")
+            .refreshable { await syncEngine.syncAll() }
         }
     }
 }

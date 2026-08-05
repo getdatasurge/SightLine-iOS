@@ -4,6 +4,7 @@ import SwiftUI
 @MainActor
 struct JobListView: View {
     @Query(sort: \JobSummary.updatedAt, order: .reverse) private var jobs: [JobSummary]
+    @Environment(SyncEngine.self) private var syncEngine
 
     var body: some View {
         NavigationStack {
@@ -34,6 +35,7 @@ struct JobListView: View {
                 }
             }
             .navigationTitle("Jobs")
+            .refreshable { await syncEngine.syncAll() }
         }
     }
 }
