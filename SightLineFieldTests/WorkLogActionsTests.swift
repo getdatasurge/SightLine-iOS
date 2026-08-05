@@ -150,7 +150,7 @@ final class WorkLogActionsTests: XCTestCase {
 
     func testOpenWorkLogReturnsCheckedInRowMatchingJob() async throws {
         let context = try makeContext()
-        context.insert(WorkLog(id: "open-1", clientUuid: "u1", jobId: "job-1", status: "CHECKED_IN", checkInAt: Date(), updatedAt: Date()))
+        context.insert(WorkLog(id: "open-1", clientUuid: "u1", jobId: "job-1", technicianId: "tech-1", status: "CHECKED_IN", checkInAt: Date(), updatedAt: Date()))
         context.insert(WorkLog(id: "closed-1", clientUuid: "u2", jobId: "job-1", status: "CHECKED_OUT", checkInAt: Date(), checkOutAt: Date(), updatedAt: Date()))
         context.insert(WorkLog(id: "open-2", clientUuid: "u3", jobId: "job-2", status: "CHECKED_IN", checkInAt: Date(), updatedAt: Date()))
         try context.save()
@@ -170,18 +170,20 @@ final class WorkLogActionsTests: XCTestCase {
         XCTAssertNil(actions.openWorkLog(onJob: "job-1", technicianId: "tech-1"))
     }
 
-    /// `WorkLog` (`Models.swift`) has no persisted `technicianId` column today — see
-    /// `WorkLogActions.openWorkLog`'s doc comment. This pins the *current, honest* behavior
-    /// (job + status only) so a future column addition changes this test deliberately instead
-    /// of silently.
-    func testOpenWorkLogAcceptsTechnicianIdButCannotYetFilterByIt() async throws {
+    /// With a `technicianId`, only the caller's own open session counts: a teammate's row on
+    /// the same job and a pre-column row (`technicianId == nil`) are both excluded. With
+    /// `nil` (account without a Technician row) the query falls back to job-wide.
+    func testOpenWorkLogScopesToCallerTechnician() async throws {
         let context = try makeContext()
-        context.insert(WorkLog(id: "open-1", clientUuid: "u1", jobId: "job-1", status: "CHECKED_IN", checkInAt: Date(), updatedAt: Date()))
+        context.insert(WorkLog(id: "mine", clientUuid: "u1", jobId: "job-1", technicianId: "tech-1", status: "CHECKED_IN", checkInAt: Date(timeIntervalSince1970: 100), updatedAt: Date(timeIntervalSince1970: 100)))
+        context.insert(WorkLog(id: "teammate", clientUuid: "u2", jobId: "job-1", technicianId: "tech-2", status: "CHECKED_IN", checkInAt: Date(timeIntervalSince1970: 200), updatedAt: Date(timeIntervalSince1970: 200)))
+        context.insert(WorkLog(id: "legacy", clientUuid: "u3", jobId: "job-1", status: "CHECKED_IN", checkInAt: Date(timeIntervalSince1970: 300), updatedAt: Date(timeIntervalSince1970: 300)))
         try context.save()
         let actions = WorkLogActions(gateway: StubWorkLogGateway(), modelContext: context)
 
-        XCTAssertEqual(actions.openWorkLog(onJob: "job-1", technicianId: "some-other-tech")?.id, "open-1")
-        XCTAssertEqual(actions.openWorkLog(onJob: "job-1", technicianId: nil)?.id, "open-1")
+        XCTAssertEqual(actions.openWorkLog(onJob: "job-1", technicianId: "tech-1")?.id, "mine")
+        XCTAssertNil(actions.openWorkLog(onJob: "job-1", technicianId: "tech-3"))
+        XCTAssertEqual(actions.openWorkLog(onJob: "job-1", technicianId: nil)?.id, "legacy")
     }
 
     func testOpenWorkLogPicksMostRecentlyOpenedWhenMultipleMatch() async throws {
