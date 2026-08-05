@@ -189,28 +189,39 @@ final class SyncEngine {
         }
     }
 
-    /// `clientUuid` is the local offline-create idempotency key — a server-sourced log has no
-    /// such thing, so it reuses the server `id` (deterministic, always non-empty, and
-    /// incidentally distinguishable from a locally-created-then-synced row, whose `clientUuid`
-    /// would be a client-generated UUID instead).
+    /// A row born from an offline check-in is keyed locally by `clientUuid` (M4 A-I3: its `id`
+    /// was client-minted before the server ever assigned one) and stays that way forever, even
+    /// after the outbox reconciles the server's own row — see `OutboxWorker.reconcile`'s doc
+    /// comment. A wire row from `/work-logs` carries both: `dto.id` (the server's real primary
+    /// key) and `dto.clientUuid` (the same client-minted key, echoed back) when it originated
+    /// from a clientUuid-keyed check-in (M4 A-B1); `dto.clientUuid` is `nil` for an office-created
+    /// row that never went through that path, which falls back to `dto.id` — the same value this
+    /// class's own fallback insert below stores as `clientUuid` for such a row. Matching existing
+    /// rows by `dto.clientUuid ?? dto.id` against `WorkLog.clientUuid` (never `WorkLog.id`) finds
+    /// the right row either way, instead of missing a clientUuid-keyed one (because `dto.id !=
+    /// local.id`) and inserting a duplicate.
     private func syncWorkLogs() async throws {
         let watermark = watermarks.get(.workLogs)
         let dtos = try await backend.fetchWorkLogs(since: SyncPlanner.decide(watermark: watermark).since)
         guard !dtos.isEmpty else { return }
 
-        let ids = Set(dtos.map(\.id))
-        let existing = try modelContext.fetch(FetchDescriptor<WorkLog>(predicate: #Predicate { ids.contains($0.id) }))
-        let existingById = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
+        let keys = Set(dtos.map { $0.clientUuid ?? $0.id })
+        let existing = try modelContext.fetch(FetchDescriptor<WorkLog>(predicate: #Predicate { keys.contains($0.clientUuid) }))
+        let existingByKey = Dictionary(uniqueKeysWithValues: existing.map { ($0.clientUuid, $0) })
         // See `syncJobs`'s `dtoById` comment: mirrors `planUpserts`'s newest-wins tie-break.
-        let dtoById = Dictionary(dtos.map { ($0.id, $0) }, uniquingKeysWith: { current, new in current.updatedAt >= new.updatedAt ? current : new })
+        let dtoByKey = Dictionary(
+            dtos.map { ($0.clientUuid ?? $0.id, $0) },
+            uniquingKeysWith: { current, new in current.updatedAt >= new.updatedAt ? current : new }
+        )
 
         let plans = SyncPlanner.planUpserts(
-            incoming: dtos.map { SyncRecord(id: $0.id, updatedAt: $0.updatedAt) },
-            existingIds: Set(existingById.keys)
+            incoming: dtos.map { SyncRecord(id: $0.clientUuid ?? $0.id, updatedAt: $0.updatedAt) },
+            existingIds: Set(existingByKey.keys)
         )
         for plan in plans {
-            guard let dto = dtoById[plan.record.id] else { continue }
-            if let model = existingById[plan.record.id] {
+            guard let dto = dtoByKey[plan.record.id] else { continue }
+            if let model = existingByKey[plan.record.id] {
+                // `id`/`clientUuid` are left untouched — see the doc comment above.
                 model.jobId = dto.jobId
                 model.technicianId = dto.technicianId
                 model.workTypeId = dto.workTypeId
@@ -221,10 +232,19 @@ final class SyncEngine {
                 model.notes = dto.notes
                 model.updatedAt = dto.updatedAt
             } else {
+                // `id: dto.clientUuid ?? dto.id` — not `dto.id` — so a row born from a
+                // clientUuid-keyed check-in ends up with `id == clientUuid` on *every* device
+                // that ever inserts it fresh, not just the one that originated it (which pins
+                // this via `WorkLogActions.checkIn`/`OutboxWorker.reconcile`, never via this
+                // path). Uniform invariant: `id == clientUuid` whenever `clientUuid` is known,
+                // full stop — `dto.id` is never sent back to the server by anything in this
+                // app (check-out keys by `clientUuid`, not id), so there's no cost to preferring
+                // it, and a path-independent invariant is simpler to reason about than one that
+                // depends on which device/route first saw the row.
                 modelContext.insert(
                     WorkLog(
-                        id: dto.id,
-                        clientUuid: dto.id,
+                        id: dto.clientUuid ?? dto.id,
+                        clientUuid: dto.clientUuid ?? dto.id,
                         jobId: dto.jobId,
                         technicianId: dto.technicianId,
                         workTypeId: dto.workTypeId,

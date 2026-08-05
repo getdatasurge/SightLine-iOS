@@ -66,6 +66,15 @@ struct WorkLogDTO: Decodable, Equatable, Sendable {
     let notes: String?
     let status: String
     let updatedAt: Date
+    /// The work-log's client-minted idempotency key (M3 B1), echoed back on every projection
+    /// (list, check-in, check-out) once a row is created via clientUuid-keyed check-in (M4
+    /// A-B1); `nil` for a row the office created without one. `var` + a default value, unlike
+    /// every other optional field on this DTO (`let`, no default): a `let` with a default is
+    /// silently excluded from `Decodable` synthesis (the default always wins, the wire value is
+    /// never read), which would make this field permanently `nil`. `var` keeps it genuinely
+    /// decodable while still letting call sites that don't know about it (e.g.
+    /// `SyncEngineTests.swift`, outside this task's file scope) keep compiling unchanged.
+    var clientUuid: String? = nil
 }
 
 /// No `jobId` — a `Surface` isn't a direct child of `Job` server-side, so `/jobs/{id}/surfaces`

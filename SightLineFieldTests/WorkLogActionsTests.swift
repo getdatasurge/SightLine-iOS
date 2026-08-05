@@ -2,22 +2,25 @@ import XCTest
 import SwiftData
 @testable import SightLineField
 
-/// Fakes `WorkLogGateway` — the two-write-op seam `WorkLogActions` depends on — instead of
-/// standing up the generated `Client`, mirroring `StubSyncBackend`/`SyncEngineTests`.
+/// Fakes `WorkLogGateway` — the two-write-op seam `OutboxWorker` depends on — instead of
+/// standing up the generated `Client`, mirroring `StubSyncBackend`/`SyncEngineTests`. As of M4,
+/// `WorkLogActions` itself never calls this (it only enqueues); the tests below assert the
+/// gateway is genuinely never touched synchronously from `checkIn`/`checkOut`. Drain-time
+/// behavior (this stub actually being invoked) belongs to `OutboxWorkerTests`.
 final class StubWorkLogGateway: WorkLogGateway, @unchecked Sendable {
     var checkInResult: Result<WorkLogDTO, Error> = .failure(ApiError.decoding)
     var checkOutResult: Result<WorkLogDTO, Error> = .failure(ApiError.decoding)
 
     private(set) var checkInCalls: [(jobId: String, workTypeId: String?, notes: String?, clientUuid: String)] = []
-    private(set) var checkOutCalls: [(workLogId: String, quantity: Double?, notes: String?)] = []
+    private(set) var checkOutCalls: [(workLogClientUuid: String, quantity: Double?, notes: String?)] = []
 
     func checkIn(jobId: String, workTypeId: String?, notes: String?, clientUuid: String) async throws -> WorkLogDTO {
         checkInCalls.append((jobId, workTypeId, notes, clientUuid))
         return try checkInResult.get()
     }
 
-    func checkOut(workLogId: String, quantity: Double?, notes: String?) async throws -> WorkLogDTO {
-        checkOutCalls.append((workLogId, quantity, notes))
+    func checkOut(workLogClientUuid: String, quantity: Double?, notes: String?) async throws -> WorkLogDTO {
+        checkOutCalls.append((workLogClientUuid, quantity, notes))
         return try checkOutResult.get()
     }
 }
@@ -28,122 +31,112 @@ final class WorkLogActionsTests: XCTestCase {
         try StoreContainer.make(inMemory: true).mainContext
     }
 
-    private func dto(
-        id: String,
-        jobId: String = "job-1",
-        technicianId: String? = "tech-1",
-        workTypeId: String? = "wt-1",
-        checkInAt: Date = Date(timeIntervalSince1970: 1_000),
-        checkOutAt: Date? = nil,
-        quantity: Double? = nil,
-        notes: String? = nil,
-        status: String = "CHECKED_IN",
-        updatedAt: Date = Date(timeIntervalSince1970: 1_000)
-    ) -> WorkLogDTO {
-        WorkLogDTO(
-            id: id,
-            jobId: jobId,
-            technicianId: technicianId,
-            workTypeId: workTypeId,
-            checkInAt: checkInAt,
-            checkOutAt: checkOutAt,
-            quantity: quantity,
-            notes: notes,
-            status: status,
-            updatedAt: updatedAt
-        )
-    }
-
     // MARK: - checkIn
 
-    func testCheckInSendsGeneratedClientUuidAndUpsertsNewRow() async throws {
+    func testCheckInWritesOptimisticCheckedInRowAndEnqueuesOutboxItem() throws {
         let context = try makeContext()
         let gateway = StubWorkLogGateway()
-        gateway.checkInResult = .success(dto(id: "wl-1", notes: "started"))
         let actions = WorkLogActions(gateway: gateway, modelContext: context)
 
-        let result = try await actions.checkIn(jobId: "job-1", workTypeId: "wt-1", notes: "started")
+        let result = actions.checkIn(jobId: "job-1", workTypeId: "wt-1", notes: "started")
 
-        XCTAssertEqual(result.id, "wl-1")
-        XCTAssertEqual(gateway.checkInCalls.count, 1)
-        let call = try XCTUnwrap(gateway.checkInCalls.first)
-        XCTAssertEqual(call.jobId, "job-1")
-        XCTAssertEqual(call.workTypeId, "wt-1")
-        XCTAssertEqual(call.notes, "started")
-        // A real, freshly-minted UUID — not empty, not the server row id, not reused garbage.
-        XCTAssertNotNil(UUID(uuidString: call.clientUuid))
+        // A real, freshly-minted UUID — not empty, not server-sourced garbage.
+        XCTAssertNotNil(UUID(uuidString: result.clientUuid))
+        XCTAssertEqual(result.id, result.clientUuid, "the optimistic row's id is pinned to its own clientUuid")
+        XCTAssertEqual(result.status, "CHECKED_IN")
+        XCTAssertEqual(result.jobId, "job-1")
+        XCTAssertEqual(result.workTypeId, "wt-1")
+        XCTAssertEqual(result.notes, "started")
+        XCTAssertNil(result.technicianId, "unknown locally until the outbox reconciles the server's row")
 
-        let stored = try XCTUnwrap(context.fetch(FetchDescriptor<WorkLog>()).first)
-        XCTAssertEqual(stored.id, "wl-1")
-        XCTAssertEqual(stored.clientUuid, call.clientUuid, "a fresh check-in keeps the locally-minted idempotency key, not the server id")
-        XCTAssertEqual(stored.status, "CHECKED_IN")
-        XCTAssertEqual(stored.jobId, "job-1")
-        XCTAssertEqual(try context.fetch(FetchDescriptor<WorkLog>()).count, 1)
+        let workLogs = try context.fetch(FetchDescriptor<WorkLog>())
+        XCTAssertEqual(workLogs.count, 1)
+        XCTAssertEqual(workLogs.first?.id, result.clientUuid)
+
+        let outboxItems = try context.fetch(FetchDescriptor<SyncOutbox>())
+        XCTAssertEqual(outboxItems.count, 1)
+        let item = try XCTUnwrap(outboxItems.first)
+        XCTAssertEqual(item.endpoint, OutboxEndpoint.checkIn.rawValue)
+        XCTAssertEqual(item.state, OutboxState.pending.rawValue)
+        XCTAssertEqual(item.attempts, 0)
+        let payload = try JSONDecoder().decode(CheckInPayload.self, from: item.payload)
+        XCTAssertEqual(payload.jobId, "job-1")
+        XCTAssertEqual(payload.workTypeId, "wt-1")
+        XCTAssertEqual(payload.notes, "started")
+        XCTAssertEqual(payload.clientUuid, result.clientUuid)
+
+        // Nothing about this call stack touches the network: the actual gateway call only ever
+        // happens inside `outboxWorker.drain()`, kicked off fire-and-forget — since `checkIn`
+        // itself has no `await` before this point, no task the MainActor scheduled on its behalf
+        // can possibly have run yet.
+        XCTAssertTrue(gateway.checkInCalls.isEmpty, "checkIn must not call the gateway synchronously")
     }
 
-    func testCheckInReplayMutatesExistingRowInPlaceWithoutDuplicating() async throws {
+    func testCheckInMintsAFreshUuidPerCall() throws {
         let context = try makeContext()
-        context.insert(WorkLog(
-            id: "wl-1", clientUuid: "prior-uuid", jobId: "job-1", workTypeId: "wt-old",
-            status: "CHECKED_IN", checkInAt: Date(timeIntervalSince1970: 500), updatedAt: Date(timeIntervalSince1970: 500)
-        ))
-        try context.save()
+        let actions = WorkLogActions(gateway: StubWorkLogGateway(), modelContext: context)
 
-        let gateway = StubWorkLogGateway()
-        // Idempotent replay: server returns the SAME row id it already had (clientUuid collision).
-        gateway.checkInResult = .success(dto(id: "wl-1", notes: "replayed", updatedAt: Date(timeIntervalSince1970: 900)))
-        let actions = WorkLogActions(gateway: gateway, modelContext: context)
+        let first = actions.checkIn(jobId: "job-1", workTypeId: nil, notes: nil)
+        let second = actions.checkIn(jobId: "job-1", workTypeId: nil, notes: nil)
 
-        _ = try await actions.checkIn(jobId: "job-1", workTypeId: "wt-1", notes: "replayed")
-
-        let rows = try context.fetch(FetchDescriptor<WorkLog>())
-        XCTAssertEqual(rows.count, 1, "replay must mutate, never duplicate")
-        XCTAssertEqual(rows[0].clientUuid, "prior-uuid", "an existing row's local clientUuid is never overwritten by a fresh mint")
-        XCTAssertEqual(rows[0].notes, "replayed")
-        XCTAssertEqual(rows[0].workTypeId, "wt-1")
+        XCTAssertNotEqual(first.clientUuid, second.clientUuid)
+        XCTAssertEqual(try context.fetchCount(FetchDescriptor<WorkLog>()), 2)
+        XCTAssertEqual(try context.fetchCount(FetchDescriptor<SyncOutbox>()), 2)
     }
 
     // MARK: - checkOut
 
-    func testCheckOutUpsertsExistingRowAndFlipsStatus() async throws {
+    func testCheckOutMutatesExistingRowOptimisticallyAndEnqueues() throws {
         let context = try makeContext()
         context.insert(WorkLog(
-            id: "wl-1", clientUuid: "uuid-1", jobId: "job-1", workTypeId: "wt-1",
+            id: "uuid-1", clientUuid: "uuid-1", jobId: "job-1", workTypeId: "wt-1",
             status: "CHECKED_IN", checkInAt: Date(timeIntervalSince1970: 500), updatedAt: Date(timeIntervalSince1970: 500)
         ))
         try context.save()
 
         let gateway = StubWorkLogGateway()
-        gateway.checkOutResult = .success(dto(
-            id: "wl-1", checkInAt: Date(timeIntervalSince1970: 500), checkOutAt: Date(timeIntervalSince1970: 900),
-            quantity: 12.5, notes: "done", status: "CHECKED_OUT", updatedAt: Date(timeIntervalSince1970: 900)
-        ))
         let actions = WorkLogActions(gateway: gateway, modelContext: context)
 
-        let result = try await actions.checkOut(workLogId: "wl-1", quantity: 12.5, notes: "done")
+        let result = actions.checkOut(workLogClientUuid: "uuid-1", quantity: 12.5, notes: "done")
 
-        XCTAssertEqual(gateway.checkOutCalls.count, 1)
-        XCTAssertEqual(gateway.checkOutCalls.first?.workLogId, "wl-1")
-        XCTAssertEqual(gateway.checkOutCalls.first?.quantity, 12.5)
-        XCTAssertEqual(result.status, "CHECKED_OUT")
-        XCTAssertEqual(result.quantity, 12.5)
-        XCTAssertEqual(result.clientUuid, "uuid-1", "checking out an existing row never touches its clientUuid")
+        let model = try XCTUnwrap(result)
+        XCTAssertEqual(model.status, "CHECKED_OUT")
+        XCTAssertEqual(model.quantity, 12.5)
+        XCTAssertEqual(model.notes, "done")
+        XCTAssertNotNil(model.checkOutAt)
+        XCTAssertEqual(model.id, "uuid-1", "checking out never touches id/clientUuid")
+        XCTAssertEqual(model.clientUuid, "uuid-1")
 
-        let rows = try context.fetch(FetchDescriptor<WorkLog>())
-        XCTAssertEqual(rows.count, 1, "check-out must mutate, never duplicate")
+        let workLogs = try context.fetch(FetchDescriptor<WorkLog>())
+        XCTAssertEqual(workLogs.count, 1, "check-out must mutate, never duplicate")
+
+        let outboxItems = try context.fetch(FetchDescriptor<SyncOutbox>())
+        XCTAssertEqual(outboxItems.count, 1)
+        let item = try XCTUnwrap(outboxItems.first)
+        XCTAssertEqual(item.endpoint, OutboxEndpoint.checkOut.rawValue)
+        XCTAssertEqual(item.state, OutboxState.pending.rawValue)
+        let payload = try JSONDecoder().decode(CheckOutPayload.self, from: item.payload)
+        XCTAssertEqual(payload.workLogClientUuid, "uuid-1")
+        XCTAssertEqual(payload.quantity, 12.5)
+        XCTAssertEqual(payload.notes, "done")
+
+        XCTAssertTrue(gateway.checkOutCalls.isEmpty, "checkOut must not call the gateway synchronously")
     }
 
-    func testCheckOutInsertsFallbackRowWhenLocalCopyMissing() async throws {
+    func testCheckOutReturnsNilAndStillEnqueuesWhenLocalRowMissing() throws {
         let context = try makeContext()
-        let gateway = StubWorkLogGateway()
-        gateway.checkOutResult = .success(dto(id: "wl-remote", checkOutAt: Date(timeIntervalSince1970: 900), status: "CHECKED_OUT"))
-        let actions = WorkLogActions(gateway: gateway, modelContext: context)
+        let actions = WorkLogActions(gateway: StubWorkLogGateway(), modelContext: context)
 
-        // No local WorkLog row for "wl-remote" — e.g. this device never synced it locally.
-        let result = try await actions.checkOut(workLogId: "wl-remote", quantity: nil, notes: nil)
+        // No local WorkLog row for "missing-uuid" — e.g. this device never saw the check-in.
+        let result = actions.checkOut(workLogClientUuid: "missing-uuid", quantity: nil, notes: nil)
 
-        XCTAssertEqual(result.id, "wl-remote")
-        XCTAssertEqual(result.clientUuid, "wl-remote", "fallback insert reuses the server id, mirroring SyncEngine.syncWorkLogs")
+        XCTAssertNil(result, "nothing local to mutate optimistically")
+        XCTAssertTrue(try context.fetch(FetchDescriptor<WorkLog>()).isEmpty, "checkOut never fabricates a row itself")
+
+        let outboxItems = try context.fetch(FetchDescriptor<SyncOutbox>())
+        XCTAssertEqual(outboxItems.count, 1, "the enqueue still happens — a later drain reconciles whatever the server says")
+        let payload = try JSONDecoder().decode(CheckOutPayload.self, from: try XCTUnwrap(outboxItems.first).payload)
+        XCTAssertEqual(payload.workLogClientUuid, "missing-uuid")
     }
 
     // MARK: - openWorkLog
@@ -194,52 +187,6 @@ final class WorkLogActionsTests: XCTestCase {
         let actions = WorkLogActions(gateway: StubWorkLogGateway(), modelContext: context)
 
         XCTAssertEqual(actions.openWorkLog(onJob: "job-1", technicianId: nil)?.id, "newer")
-    }
-
-    // MARK: - Error mapping
-
-    func testCheckInPropagatesUnauthorized() async throws {
-        let context = try makeContext()
-        let gateway = StubWorkLogGateway()
-        gateway.checkInResult = .failure(ApiError.unauthorized)
-        let actions = WorkLogActions(gateway: gateway, modelContext: context)
-
-        do {
-            _ = try await actions.checkIn(jobId: "job-1", workTypeId: nil, notes: nil)
-            XCTFail("expected ApiError.unauthorized")
-        } catch ApiError.unauthorized {
-            // expected
-        }
-        XCTAssertTrue(try context.fetch(FetchDescriptor<WorkLog>()).isEmpty, "a failed check-in must not write a row")
-    }
-
-    func testCheckOutPropagatesServerError500() async throws {
-        let context = try makeContext()
-        let gateway = StubWorkLogGateway()
-        gateway.checkOutResult = .failure(ApiError.server(status: 500))
-        let actions = WorkLogActions(gateway: gateway, modelContext: context)
-
-        do {
-            _ = try await actions.checkOut(workLogId: "wl-1", quantity: nil, notes: nil)
-            XCTFail("expected ApiError.server(status: 500)")
-        } catch ApiError.server(let status) {
-            XCTAssertEqual(status, 500)
-        }
-    }
-
-    func testCheckInPropagatesNetworkError() async throws {
-        let context = try makeContext()
-        let gateway = StubWorkLogGateway()
-        struct DummyError: Error {}
-        gateway.checkInResult = .failure(ApiError.network(DummyError()))
-        let actions = WorkLogActions(gateway: gateway, modelContext: context)
-
-        do {
-            _ = try await actions.checkIn(jobId: "job-1", workTypeId: nil, notes: nil)
-            XCTFail("expected ApiError.network")
-        } catch ApiError.network {
-            // expected
-        }
     }
 
     // MARK: - ApiError.userMessage (sheet-facing copy)

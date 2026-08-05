@@ -3,18 +3,23 @@ import Observation
 import OpenAPIRuntime
 import SwiftData
 
-/// The only seam that touches the generated `/work-logs/check-in` and `/work-logs/{id}/check-out`
+/// The only seam that touches the generated `/work-logs/check-in` and `/work-logs/check-out`
 /// operations. `LiveWorkLogGateway` wraps `Client`; tests fake this seam instead of standing up
-/// the generated client — same split as `AuthGateway`/`LiveAuthGateway`.
+/// the generated client — same split as `AuthGateway`/`LiveAuthGateway`. `OutboxWorker` is the
+/// sole caller now (M4 A-I3) — `WorkLogActions` no longer calls this directly, it writes
+/// optimistically and enqueues instead; see that class's doc comment.
 protocol WorkLogGateway: Sendable {
     /// `clientUuid` is minted by the caller (`WorkLogActions.checkIn`), not this seam — keeping
-    /// idempotency-key generation out of the gateway means a retry (e.g. after a transient
-    /// network error) reuses the same key instead of minting a new one per attempt.
+    /// idempotency-key generation out of the gateway means a retry (an outbox replay after a
+    /// transient failure) reuses the same key instead of minting a new one per attempt.
     func checkIn(jobId: String, workTypeId: String?, notes: String?, clientUuid: String) async throws -> WorkLogDTO
-    func checkOut(workLogId: String, quantity: Double?, notes: String?) async throws -> WorkLogDTO
+    /// Keyed by the work-log's `clientUuid`, not a server id (M4 A-B2) — offline, a check-in has
+    /// no server id yet for a check-out to reference. Idempotent server-side: replaying against
+    /// an already-CHECKED_OUT log returns that same row instead of 404/409ing.
+    func checkOut(workLogClientUuid: String, quantity: Double?, notes: String?) async throws -> WorkLogDTO
 }
 
-/// Wraps the generated `Client` for the two M3 write operations. Both endpoints are
+/// Wraps the generated `Client` for the two M3/M4 write operations. Both endpoints are
 /// device-session only; `technicianId` is forced server-side from the session and is never part
 /// of either request body (a client-supplied one 400s on check-in — there's no field for it to
 /// even occupy here).
@@ -22,8 +27,8 @@ protocol WorkLogGateway: Sendable {
 /// Operation names (`post_sol_work_hyphen_logs_sol_check_hyphen_in` etc.) are
 /// `swift-openapi-generator`'s literal `<method><path>` output under the `defensive` naming
 /// strategy — verified directly against the freshly-generated `Types.swift`/`Client.swift`
-/// (DerivedData, same session as the M3 snapshot commit), not hand-derived. See
-/// `AuthGateway.swift`'s doc comment for the general naming-strategy explanation.
+/// (DerivedData, same session as the M4a snapshot regen). See `AuthGateway.swift`'s doc comment
+/// for the general naming-strategy explanation.
 struct LiveWorkLogGateway: WorkLogGateway {
     let client: Client
 
@@ -55,11 +60,15 @@ struct LiveWorkLogGateway: WorkLogGateway {
         }
     }
 
-    func checkOut(workLogId: String, quantity: Double?, notes: String?) async throws -> WorkLogDTO {
-        let response: Operations.post_sol_work_hyphen_logs_sol__lcub_id_rcub__sol_check_hyphen_out.Output
+    /// `POST /work-logs/check-out` (M4 A-B2) — replaces the old path-id route outright; body
+    /// only, keyed by `workLogClientUuid` rather than a path `{id}`. Always `200`, never `201`:
+    /// idempotent replay against an already-CHECKED_OUT log returns that same row rather than a
+    /// fresh transition, so there's only ever one success case to decode.
+    func checkOut(workLogClientUuid: String, quantity: Double?, notes: String?) async throws -> WorkLogDTO {
+        let response: Operations.post_sol_work_hyphen_logs_sol_check_hyphen_out.Output
         do {
-            response = try await client.post_sol_work_hyphen_logs_sol__lcub_id_rcub__sol_check_hyphen_out(
-                .init(path: .init(id: workLogId), body: .json(.init(quantity: quantity, notes: notes)))
+            response = try await client.post_sol_work_hyphen_logs_sol_check_hyphen_out(
+                .init(body: .json(.init(workLogClientUuid: workLogClientUuid, quantity: quantity, notes: notes)))
             )
         } catch {
             throw ApiError.network(error)
@@ -114,19 +123,27 @@ struct LiveWorkLogGateway: WorkLogGateway {
     private static let isoWhole = ISO8601DateFormatter()
 }
 
-/// Check-in/check-out actions over the generated client, plus the local "what's my open
-/// session?" store query. `checkIn`/`checkOut` upsert the server's returned row into SwiftData
-/// (mirroring `SyncEngine.syncWorkLogs`'s insert-or-mutate-then-save shape) so every `@Query`
-/// bound to `WorkLog` across the app — `JobDetailView`'s action area, `WorkLogsView`'s banner and
-/// list — reflects the write immediately, with no separate re-sync required.
-///
-/// Online-only for M3 (per the spec's non-goals): a network failure surfaces as `ApiError
-/// .network` and is not queued for retry. Offline writes/outbox land in M4.
+/// Check-in/check-out actions, plus the local "what's my open session?" store query. As of M4
+/// (A-I3) both writes are **optimistic + queued**, never a direct network call on this call
+/// stack: mint the work-log's `clientUuid`, write the local `WorkLog` row as if the call already
+/// succeeded, enqueue the real request onto `outboxWorker`, and kick off a drain without waiting
+/// for it. Neither method throws or is `async` any more — there's nothing on this call stack
+/// that can fail, so a technician offline never sees an error; the write "succeeds" instantly
+/// and syncs whenever the outbox next drains (foreground, reconnect, or a later explicit
+/// `outboxWorker.drain()`). See `docs/superpowers/specs/2026-08-05-m4-offline-outbox.md`'s
+/// "Keystone" section: `clientUuid` is the work-log's durable identity across the wire, and the
+/// local row's `id` stays pinned to it forever — no id-remapping once the outbox reconciles it.
 @MainActor
 @Observable
 final class WorkLogActions {
-    private let gateway: WorkLogGateway
     private let modelContext: ModelContext
+
+    /// The outbox this instance's writes enqueue into. Exposed (not just an implementation
+    /// detail) so the composition root can wire `Connectivity.onBecameOnline`/the settings
+    /// sync-status view to the same worker via `appDependencies.workLogActions.outboxWorker`,
+    /// without `WorkLogActions` itself needing to proxy `isDraining`/`pendingCount`/
+    /// `conflictCount`/`retry(clientUuid:)`.
+    let outboxWorker: OutboxWorker
 
     /// Production entry point — matches `AppDependencies`' composition-root call
     /// (`WorkLogActions(client:modelContext:)`) exactly, building the live gateway internally.
@@ -135,21 +152,26 @@ final class WorkLogActions {
     }
 
     /// Test/seam entry point — takes the `WorkLogGateway` protocol directly so unit tests can
-    /// fake the network without standing up the generated `Client`.
+    /// fake the network without standing up the generated `Client`. Builds its own
+    /// `OutboxWorker` from the same `gateway`/`modelContext` rather than taking one as a separate
+    /// parameter, so this initializer's shape — and `AppDependencies`' existing call site — never
+    /// has to change to add one ("WorkLogActions gains an OutboxWorker dependency", composed
+    /// here rather than injected).
     init(gateway: WorkLogGateway, modelContext: ModelContext) {
-        self.gateway = gateway
         self.modelContext = modelContext
+        self.outboxWorker = OutboxWorker(gateway: gateway, modelContext: modelContext)
     }
 
     /// The caller's own open ("CHECKED_IN") work-log session on a job, if any — drives the
     /// Check In ↔ Check Out state split in `JobDetailView`/`WorkLogsView`.
     ///
     /// Scoped to the caller's `technicianId` when known: `WorkLog.technicianId` is persisted by
-    /// `SyncEngine.syncWorkLogs` and by this class's own upserts, so a teammate's open session
-    /// on a shared job never flips this caller's UI into "Check Out". Rows synced before the
-    /// column existed carry `nil` and are excluded from the scoped query — acceptable: they
-    /// predate the caller's session on that job. With `technicianId == nil` (account has no
-    /// Technician row) falls back to job-wide, mirroring the business-wide sync stance.
+    /// `SyncEngine.syncWorkLogs` and by the outbox's own reconcile step, so a teammate's open
+    /// session on a shared job never flips this caller's UI into "Check Out". Rows synced before
+    /// the column existed, or not yet reconciled from an optimistic check-in, carry `nil` and are
+    /// excluded from the scoped query — acceptable: they predate (or haven't confirmed) the
+    /// caller's session on that job. With `technicianId == nil` (account has no Technician row)
+    /// falls back to job-wide, mirroring the business-wide sync stance.
     func openWorkLog(onJob jobId: String, technicianId: String?) -> WorkLog? {
         let predicate: Predicate<WorkLog>
         if let technicianId {
@@ -162,72 +184,73 @@ final class WorkLogActions {
         return (try? modelContext.fetch(descriptor))?.first
     }
 
-    /// Opens a new session. Mints its own `clientUuid` (the server-side idempotency key, B1) so
-    /// a retry after a transient failure — the caller re-invoking `checkIn` with the *same*
-    /// in-flight state — never double-creates; a genuinely new tap starts a fresh key.
+    /// Opens a new session, optimistically. Mints `clientUuid` — the work-log's durable identity
+    /// from this instant on, doubling as the local row's `id` forever (reconciled from the
+    /// server's response, but never remapped to the server's own row id) — writes the row
+    /// already `CHECKED_IN`, and enqueues the real check-in call.
     @discardableResult
-    func checkIn(jobId: String, workTypeId: String?, notes: String?) async throws -> WorkLog {
+    func checkIn(jobId: String, workTypeId: String?, notes: String?) -> WorkLog {
         let clientUuid = UUID().uuidString
-        let dto = try await gateway.checkIn(jobId: jobId, workTypeId: workTypeId, notes: notes, clientUuid: clientUuid)
-        return try upsert(dto, newRowClientUuid: clientUuid)
-    }
-
-    /// Closes the caller's own open session. `workLogId` identifies which row — no local lookup
-    /// needed since the presenting view already holds the specific `WorkLog` (from its own
-    /// `@Query` or `openWorkLog(onJob:)`) before offering the Check Out sheet.
-    @discardableResult
-    func checkOut(workLogId: String, quantity: Double?, notes: String?) async throws -> WorkLog {
-        let dto = try await gateway.checkOut(workLogId: workLogId, quantity: quantity, notes: notes)
-        // No client-minted key on the check-out path — the row being closed already exists
-        // locally (from its own check-in or from sync), so the insert branch below is a rare
-        // fallback (e.g. this device never synced the row); `dto.id` mirrors `SyncEngine
-        // .syncWorkLogs`'s own fallback for a server-sourced row with no local idempotency key.
-        return try upsert(dto, newRowClientUuid: dto.id)
-    }
-
-    /// Insert-or-mutate + save, mirroring `SyncEngine.syncWorkLogs`'s per-row upsert exactly
-    /// (same fields copied, same shape) — the one difference is `clientUuid` on a fresh insert:
-    /// sync has no wire `clientUuid` and falls back to the server `id`, but a row born from
-    /// `checkIn` here already has the real, locally-minted key worth preserving.
-    private func upsert(_ dto: WorkLogDTO, newRowClientUuid: String) throws -> WorkLog {
-        let id = dto.id
-        let existing = try modelContext.fetch(FetchDescriptor<WorkLog>(predicate: #Predicate<WorkLog> { $0.id == id })).first
-        if let model = existing {
-            model.jobId = dto.jobId
-            model.technicianId = dto.technicianId
-            model.workTypeId = dto.workTypeId
-            model.status = dto.status
-            model.checkInAt = dto.checkInAt
-            model.checkOutAt = dto.checkOutAt
-            model.quantity = dto.quantity
-            model.notes = dto.notes
-            model.updatedAt = dto.updatedAt
-            try modelContext.save()
-            return model
-        }
+        let now = Date()
         let model = WorkLog(
-            id: dto.id,
-            clientUuid: newRowClientUuid,
-            jobId: dto.jobId,
-            technicianId: dto.technicianId,
-            workTypeId: dto.workTypeId,
-            status: dto.status,
-            checkInAt: dto.checkInAt,
-            checkOutAt: dto.checkOutAt,
-            quantity: dto.quantity,
-            notes: dto.notes,
-            updatedAt: dto.updatedAt
+            id: clientUuid,
+            clientUuid: clientUuid,
+            jobId: jobId,
+            workTypeId: workTypeId,
+            status: "CHECKED_IN",
+            checkInAt: now,
+            notes: notes,
+            updatedAt: now
         )
         modelContext.insert(model)
-        try modelContext.save()
+        enqueue(.checkIn, CheckInPayload(jobId: jobId, workTypeId: workTypeId, notes: notes, clientUuid: clientUuid))
         return model
+    }
+
+    /// Closes the caller's own open session, optimistically. `workLogClientUuid` is the
+    /// work-log's durable identity — from `checkIn`'s return value or a `@Query`-sourced
+    /// `WorkLog.clientUuid` — and is also what the check-out wire op keys by (M4 A-B2), so this
+    /// never needs a server id. Mutates the local row to `CHECKED_OUT` immediately when it's
+    /// found (the normal case: the presenting view already holds this exact row); if it somehow
+    /// isn't there yet, the enqueue still happens and a later drain's reconcile step creates it
+    /// from whatever the server returns.
+    @discardableResult
+    func checkOut(workLogClientUuid: String, quantity: Double?, notes: String?) -> WorkLog? {
+        let match = try? modelContext.fetch(FetchDescriptor<WorkLog>(
+            predicate: #Predicate<WorkLog> { $0.clientUuid == workLogClientUuid }
+        )).first
+        if let match {
+            let now = Date()
+            match.status = "CHECKED_OUT"
+            match.checkOutAt = now
+            match.quantity = quantity
+            match.notes = notes
+            match.updatedAt = now
+        }
+        enqueue(.checkOut, CheckOutPayload(workLogClientUuid: workLogClientUuid, quantity: quantity, notes: notes))
+        return match
+    }
+
+    /// Inserts a `SyncOutbox` row for `payload` and saves it in the same `ModelContext.save()`
+    /// as whatever optimistic `WorkLog` mutation `checkIn`/`checkOut` just made above (SwiftData
+    /// saves every pending change on the context, not just the object touched last), then kicks
+    /// off a drain without waiting for it — the fire-and-forget half of "optimistic + enqueue".
+    private func enqueue<Payload: Encodable>(_ endpoint: OutboxEndpoint, _ payload: Payload) {
+        // `CheckInPayload`/`CheckOutPayload` are plain strings/doubles/optionals — nothing about
+        // encoding them can fail, so this never actually traps.
+        let data = try! JSONEncoder().encode(payload)
+        modelContext.insert(SyncOutbox(clientUuid: UUID().uuidString, endpoint: endpoint.rawValue, payload: data))
+        try? modelContext.save()
+        Task { await outboxWorker.drain() }
     }
 }
 
 /// Sheet-facing copy for a thrown error. `.network` gets the spec'd offline message; every other
 /// `ApiError` case falls back to a short, honest description rather than a generic "something
 /// went wrong" that would hide a real, potentially actionable failure (403 vs. 500 look
-/// different to a technician deciding whether to retry).
+/// different to a technician deciding whether to retry). No longer reachable from
+/// `WorkLogActions.checkIn`/`checkOut` directly (M4: neither throws), but still what a future
+/// conflict-retry UI wants for `SyncOutbox.lastError`-driven messaging.
 extension ApiError {
     var userMessage: String {
         switch self {
