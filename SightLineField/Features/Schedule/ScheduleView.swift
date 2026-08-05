@@ -29,7 +29,11 @@ struct ScheduleView: View {
                         ForEach(days, id: \.day) { entry in
                             Section(entry.day.formatted(.dateTime.weekday(.wide).month().day())) {
                                 ForEach(entry.appointments) { appointment in
-                                    AppointmentRow(appointment: appointment)
+                                    NavigationLink {
+                                        JobCardView(appointmentId: appointment.id)
+                                    } label: {
+                                        AppointmentRow(appointment: appointment)
+                                    }
                                 }
                             }
                         }
@@ -72,7 +76,9 @@ private struct AppointmentRow: View {
 /// `Surface.status` has via `DS.Color.surfaceStatus` — reusing that function here would risk
 /// coincidentally recoloring an appointment status that happens to share a literal with the
 /// surface-fabrication pipeline (e.g. "COMPLETED"), so this sticks to neutral `DS` tokens.
-private struct ScheduleStatusChip: View {
+/// Internal (not `private`) — `JobCardView` reuses it for the same `Appointment.status` field
+/// on its own detail screen.
+struct ScheduleStatusChip: View {
     let status: String
 
     var body: some View {
