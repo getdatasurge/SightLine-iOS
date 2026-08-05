@@ -46,6 +46,8 @@ targets:
         UILaunchScreen: {}
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+        UIBackgroundModes: [fetch, processing]
+        BGTaskSchedulerPermittedIdentifiers: [com.getdatasurge.sightline.field.refresh]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.getdatasurge.sightline.field

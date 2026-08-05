@@ -65,6 +65,8 @@ struct SettingsSheet: View {
                                 .font(DS.Font.caption)
                                 .foregroundStyle(DS.Color.textSecondary)
                         }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityIdentifier("outbox-pending")
                     }
                     if outbox.conflictCount > 0 {
                         Text("\(outbox.conflictCount) need attention")

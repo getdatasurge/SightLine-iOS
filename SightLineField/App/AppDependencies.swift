@@ -26,13 +26,18 @@ final class AppDependencies {
     let modelContainer: ModelContainer
     let syncEngine: SyncEngine
     let workLogActions: WorkLogActions
+    let connectivity: Connectivity
+    let biometricGate: BiometricGate
+    let backgroundRefresher: BackgroundRefresher
+    let photoActions: PhotoActions
 
     init(environment: AppEnvironment = .resolve(), inMemoryStore: Bool = false) {
         let tokenStore = KeychainTokenStore()
 
         // UITest isolation: wipe any persisted session before wiring anything, so every
         // UI-test launch starts signed out regardless of what a prior run left behind.
-        if ProcessInfo.processInfo.arguments.contains("-uitest-reset") {
+        let uitestReset = ProcessInfo.processInfo.arguments.contains("-uitest-reset")
+        if uitestReset {
             tokenStore.clear()
             UserDefaults.standard.removeObject(forKey: "accountContext")
         }
@@ -64,6 +69,28 @@ final class AppDependencies {
         )
 
         self.workLogActions = WorkLogActions(client: client, modelContext: container.mainContext)
+
+        // M4b: photo uploads replay through the same outbox `WorkLogActions` writes into, so
+        // both actions classes drain one queue instead of racing two.
+        workLogActions.outboxWorker.photoGateway = LivePhotoUploadGateway(environment: environment, tokenStore: tokenStore)
+        self.photoActions = PhotoActions(outboxWorker: workLogActions.outboxWorker, modelContext: container.mainContext)
+        self.backgroundRefresher = BackgroundRefresher(outboxWorker: workLogActions.outboxWorker, syncEngine: syncEngine)
+
+        // Mirrors the `-uitest-reset` isolation above: disabled entirely so an automated launch
+        // never blocks on a biometric prompt it has no way to satisfy.
+        self.biometricGate = BiometricGate(enabled: !uitestReset)
+
+        self.connectivity = Connectivity()
+        connectivity.onBecameOnline = { [weak workLogActions] in
+            Task { await workLogActions?.outboxWorker.drain() }
+        }
+
+        // UITest hook (paired with `-uitest-reset`): suppresses the outbox drain so a queued
+        // write stays local-only and observable in Settings instead of racing the live backend
+        // — see `OfflineOutboxUITests`.
+        if ProcessInfo.processInfo.arguments.contains("-uitest-outbox-hold") {
+            workLogActions.outboxWorker.isHeld = true
+        }
 
         // Every sign-out (explicit logout, expired bootstrap, 401 theft-signal) must leave no
         // trace of the prior account on a shared installer device: drop the delta watermarks so
