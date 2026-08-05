@@ -34,7 +34,7 @@ struct SettingsSheet: View {
                     } label: {
                         Text("Log Out")
                             .font(DS.Font.body)
-                            .foregroundStyle(.red)
+                            .foregroundStyle(DS.Color.destructive)
                     }
                     .disabled(isLoggingOut)
                 }

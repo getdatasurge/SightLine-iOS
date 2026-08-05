@@ -29,6 +29,9 @@ enum DS {
         /// design.json:198 `var(--muted-foreground, #5c666e)`.
         static let textSecondary = SwiftUI.Color(hex: 0x5C666E)
 
+        /// Destructive-action tint, codified from the settings logout review nit.
+        static let destructive = SwiftUI.Color.red
+
         /// Chip fill for a `Surface.status` value. The web app models "normal" states as one
         /// grey chip and reserves color for severity (DESIGN.md's Severity-Only Rule); it has
         /// no chip vocabulary for a multi-stage fabrication pipeline (MEASURED/CUT/FILM_CUT/
