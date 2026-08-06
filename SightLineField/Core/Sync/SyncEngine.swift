@@ -355,11 +355,24 @@ final class SyncEngine {
 
         let jobIds = try modelContext.fetch(FetchDescriptor<JobSummary>()).map(\.id)
         var buildingDTOs: [(jobId: String, building: BuildingDTO)] = []
+        // Isolate per-job fetch failures: one job's buildings request failing (network, a
+        // 4xx, or an undecodable row) must not discard every other job's buildings this pass.
+        // Keep the first error to resurface at the end so the watermark is NOT advanced — the
+        // failed job is retried with the same `since` next sync, never silently skipped.
+        var firstFetchError: Error?
         for jobId in jobIds {
-            let dtos = try await backend.fetchBuildings(jobId: jobId, since: since)
-            buildingDTOs += dtos.map { (jobId, $0) }
+            do {
+                let dtos = try await backend.fetchBuildings(jobId: jobId, since: since)
+                buildingDTOs += dtos.map { (jobId, $0) }
+            } catch {
+                if firstFetchError == nil { firstFetchError = error }
+                Self.log.error("syncBuildings: fetch failed for job \(jobId, privacy: .public) — \(String(describing: error), privacy: .public)")
+            }
         }
-        guard !buildingDTOs.isEmpty else { return }
+        guard !buildingDTOs.isEmpty else {
+            if let firstFetchError { throw firstFetchError }
+            return
+        }
 
         let buildingIds = Set(buildingDTOs.map { $0.building.id })
         let existingBuildings = try modelContext.fetch(FetchDescriptor<Building>(predicate: #Predicate { buildingIds.contains($0.id) }))
@@ -450,10 +463,16 @@ final class SyncEngine {
         }
         try modelContext.save()
 
-        let seenUpdatedAts = buildingDTOs.map(\.building.updatedAt) + elevationDTOs.map(\.updatedAt)
-        if let advanced = SyncPlanner.advance(current: watermark, seen: seenUpdatedAts) {
-            watermarks.set(.buildings, to: advanced)
+        // Advance the buildings watermark only on a fully clean pass. If any job's fetch
+        // failed above, hold the watermark so the next sync re-requests with the same `since`
+        // and picks up the missed job once it recovers — then resurface the error.
+        if firstFetchError == nil {
+            let seenUpdatedAts = buildingDTOs.map(\.building.updatedAt) + elevationDTOs.map(\.updatedAt)
+            if let advanced = SyncPlanner.advance(current: watermark, seen: seenUpdatedAts) {
+                watermarks.set(.buildings, to: advanced)
+            }
         }
+        if let firstFetchError { throw firstFetchError }
     }
 }
 

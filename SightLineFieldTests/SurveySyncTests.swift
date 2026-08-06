@@ -185,6 +185,39 @@ final class SurveySyncTests: XCTestCase {
         await engine.syncAll()
         XCTAssertEqual(watermarks.get(.buildings), t1)
     }
+
+    /// One job's buildings fetch failing must not discard every other job's buildings, and the
+    /// watermark must stay put so the failed job is retried (not skipped) next pass. RED against
+    /// the old code, which aborted the whole collection on the first job's error.
+    func testOneJobFetchFailingStillSyncsOtherJobsAndHoldsWatermark() async throws {
+        let stub = StubSyncBackend()
+        let context = try makeContext()
+        seedJob(context, id: "job-ok", updatedAt: Date(timeIntervalSince1970: 5_700_000))
+        seedJob(context, id: "job-bad", updatedAt: Date(timeIntervalSince1970: 5_700_100))
+        let t = Date(timeIntervalSince1970: 5_700_500)
+        stub.buildingsResultByJob["job-ok"] = .success([
+            BuildingDTO(id: "bldg-ok", name: "Synced Building", buildingIndex: 1, notes: nil, updatedAt: t, elevations: [])
+        ])
+        stub.buildingsResultByJob["job-bad"] = .failure(ApiError.network(URLError(.timedOut)))
+        let watermarks = SyncWatermarks(defaults: freshDefaults())
+        let engine = SyncEngine(backend: stub, modelContext: context, watermarks: watermarks)
+
+        await engine.syncAll()
+
+        // Partial progress: the reachable job's building lands despite the sibling's failure.
+        XCTAssertEqual(try context.fetch(FetchDescriptor<Building>()).map(\.id), ["bldg-ok"])
+        // Watermark held so job-bad is retried with the same `since` next pass, never skipped.
+        XCTAssertNil(watermarks.get(.buildings), "a partial-failure pass must not advance the buildings watermark")
+
+        // Recovery: job-bad now succeeds; a fully-clean pass finally advances the watermark.
+        let t2 = Date(timeIntervalSince1970: 5_800_000)
+        stub.buildingsResultByJob["job-bad"] = .success([
+            BuildingDTO(id: "bldg-bad", name: "Recovered Building", buildingIndex: 1, notes: nil, updatedAt: t2, elevations: [])
+        ])
+        await engine.syncAll()
+        XCTAssertEqual(try context.fetchCount(FetchDescriptor<Building>()), 2, "the recovered job's building lands next pass")
+        XCTAssertEqual(watermarks.get(.buildings), t2, "a clean pass advances the watermark to the newest seen row")
+    }
 }
 
 // MARK: - SyncEngine.syncBuildings elevation clientUuid dedup (M5a write lane)
