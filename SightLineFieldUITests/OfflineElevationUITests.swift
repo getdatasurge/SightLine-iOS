@@ -74,8 +74,11 @@ final class OfflineElevationUITests: XCTestCase {
             // JobElevationsView: each synced building has its own "Add Elevation" row action
             // (Label(\"Add Elevation\", systemImage: \"plus\")) — first building is enough for
             // this smoke.
+            // Wait generously: a cold `-uitest-reset` launch runs a full sequential syncAll with
+            // buildings pulled LAST, so the first building Section (hence its Add Elevation row)
+            // can take well over 15s to land on a fresh store.
             let addElevation = app.buttons["Add Elevation"].firstMatch
-            XCTAssertTrue(addElevation.waitForExistence(timeout: 15), "Add Elevation action did not appear — no synced building on this job?")
+            XCTAssertTrue(addElevation.waitForExistence(timeout: 45), "Add Elevation action did not appear — no synced building on this job?")
             addElevation.tap()
 
             // AddElevationSheet: TextField("Label", ...) + toolbar "Add" confirmation action.

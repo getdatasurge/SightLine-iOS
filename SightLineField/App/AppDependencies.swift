@@ -1,5 +1,8 @@
 import Foundation
 import SwiftData
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// App composition root: wires `AppEnvironment` → `KeychainTokenStore` → `Client` →
 /// `LiveAuthGateway` → `SessionManager`, plus the SwiftData `ModelContainer`, and hands both
@@ -42,6 +45,13 @@ final class AppDependencies {
         if uitestReset {
             tokenStore.clear()
             UserDefaults.standard.removeObject(forKey: "accountContext")
+            // UI-test determinism: with animations disabled there is no in-flight sheet-present
+            // CATransaction for XCUITest to wait on, so a late `syncBuildings()` save landing
+            // mid-transition (the diagnosed JobElevationsView quiescence race) can't keep the
+            // accessibility snapshot from ever settling. No-op outside UI tests.
+            #if canImport(UIKit)
+            UIView.setAnimationsEnabled(false)
+            #endif
         }
         let refresherBox = SessionRefresherBox()
 

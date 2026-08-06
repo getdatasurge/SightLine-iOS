@@ -79,8 +79,11 @@ final class OfflinePaneCaptureUITests: XCTestCase {
             // only hides the visible title, not the accessibility label). First elevation on
             // the first building is enough for this smoke; requires a synced building with at
             // least one elevation on this job.
+            // Wait generously: a cold `-uitest-reset` launch runs a full sequential syncAll with
+            // buildings/elevations pulled LAST, so on a fresh store the first elevation row can
+            // take well over 15s to land (the reactive @Query surfaces it the moment it does).
             let capturePane = app.buttons["Capture Pane"].firstMatch
-            XCTAssertTrue(capturePane.waitForExistence(timeout: 15), "Capture Pane action did not appear — no elevation on this job's first synced building?")
+            XCTAssertTrue(capturePane.waitForExistence(timeout: 45), "Capture Pane action did not appear — no elevation on this job's first synced building?")
             capturePane.tap()
 
             // CaptureSurfaceSheet: Label / Width (in) / Height (in) TextFields, a Quantity
