@@ -54,6 +54,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.getdatasurge.sightline.field
         SWIFT_VERSION: "5.10"
         TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: S67XP8A7UZ
   SightLineFieldTests:
     type: bundle.unit-test
     platform: iOS

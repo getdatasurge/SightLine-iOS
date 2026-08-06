@@ -1,0 +1,79 @@
+name: Release (TestFlight)
+
+# Manual TestFlight build & upload. Cloud-signed via an App Store Connect API
+# key (no certs/profiles stored in the repo or CI keychain —
+# `-allowProvisioningUpdates` fetches the distribution cert + provisioning
+# profile through the API key, and `destination: upload` in
+# ci/exportOptions.plist ships the .ipa straight to App Store Connect).
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   ASC_KEY_ID         App Store Connect API key ID       (e.g. 2X9R4HXF34)
+#   ASC_ISSUER_ID      App Store Connect API issuer ID    (UUID)
+#   ASC_KEY_P8_BASE64  base64 of the AuthKey_<id>.p8 file (`base64 -i AuthKey.p8`)
+#
+# One-time App Store Connect setup (Account Holder / Admin):
+#   1. Create the app record for bundle id com.getdatasurge.sightline.field.
+#   2. Users and Access → Integrations → App Store Connect API → generate a
+#      team key with role "App Manager" (or higher); download the .p8 ONCE.
+#   3. Add the three secrets above.
+# Team ID (S67XP8A7UZ) is committed in project.yml + ci/exportOptions.plist.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+jobs:
+  testflight:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Stamp build number
+        # Unique, monotonic build number per run — TestFlight rejects duplicates.
+        # Runs after `xcodegen generate` because it regenerates Info.plist.
+        run: |
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" SightLineField/Info.plist \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string ${{ github.run_number }}" SightLineField/Info.plist
+
+      - name: Write App Store Connect API key
+        env:
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          KEY_DIR="$RUNNER_TEMP/asc_keys"
+          mkdir -p "$KEY_DIR"
+          echo "$ASC_KEY_P8_BASE64" | base64 --decode > "$KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
+          echo "ASC_KEY_PATH=$KEY_DIR/AuthKey_${ASC_KEY_ID}.p8" >> "$GITHUB_ENV"
+
+      - name: Archive
+        run: |
+          xcodebuild archive \
+            -project SightLineField.xcodeproj \
+            -scheme SightLineField \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/SightLineField.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "${{ secrets.ASC_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_ISSUER_ID }}"
+
+      - name: Export and upload to TestFlight
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/SightLineField.xcarchive" \
+            -exportOptionsPlist ci/exportOptions.plist \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "${{ secrets.ASC_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_ISSUER_ID }}"
