@@ -52,7 +52,12 @@ struct ElevationCreatePayload: Codable, Sendable, Equatable {
 /// Wire body for a queued `POST /surfaces/{id}/assign` replay (M5a) — mirrors
 /// `SurveyWriteGateway.assignSurface`'s parameters exactly. No `clientUuid`: the route is
 /// naturally idempotent (see that method's doc comment), so there's no idempotency key to
-/// thread through a replay.
+/// thread through a replay. `elevationId` stores the **local** id exactly as the assign was
+/// made (an `Elevation.id`, possibly still a field-added row's `clientUuid`); it is NEVER
+/// rewritten once queued — `OutboxWorker.attempt()` resolves it through `Elevation.serverId`
+/// fresh at every dispatch (the chain resolver, see `resolveServerId`), the same contract
+/// `SurfaceCapturePayload.elevationId` documents below. `buildingId` needs no such resolution:
+/// `Building` is read-only on-device, so it's always already a real server id.
 struct SurfaceAssignPayload: Codable, Sendable, Equatable {
     let surfaceId: String
     let buildingId: String
@@ -139,6 +144,29 @@ enum OutboxEndpoint: String, Sendable {
 /// check-out against a work-log the server never created would 404 → `classify` → a *permanent*
 /// `.conflict` the check-in's own later success can never un-stick. A skipped row simply waits
 /// for the next `drain()` call.
+///
+/// **Same-pass elevation dependency skip** (m5c-survey-capture-plan.md §2/§5 — folded in from
+/// an M5a-review finding): the identical problem one level down the chain, generalized past
+/// WorkLog. A `.surfaceAssign`/`.surfaceCapture` row's `elevationId` can itself be a
+/// field-added elevation's local id, pending that elevation's own `.elevationCreate` row
+/// landing first (FIFO-earlier by construction — an assign/capture can't be enqueued before its
+/// target elevation exists locally). If that `.elevationCreate` fails THIS pass — permanently,
+/// or transiently maxed into `.conflict` — its local id is remembered in
+/// `failedSurveyLocalIdsThisPass`, and every later `.surfaceAssign`/`.surfaceCapture` row
+/// targeting it is skipped outright (no `attempt()` call, no `attempts` increment) rather than
+/// left to the chain resolver (`resolveServerId`) alone: resolving to `nil` and returning a
+/// non-pass-stopping transient failure is already correct on its own, but `drain()`'s re-fetch
+/// loop keeps re-running passes while the fetched id set keeps changing — a permanently-failed
+/// `.elevationCreate` drops out of that set the instant it conflicts, immediately triggering
+/// another internal pass. Unlike `failedWorkLogClientUuidsThisPass` (reset fresh every
+/// `runPass`, harmless there because a dependent check-out's own failure mode — 404 on a
+/// nonexistent work log — is already an immediate permanent conflict, never attempts-gated),
+/// `failedSurveyLocalIdsThisPass` is threaded BY REFERENCE from `drain()` across every internal
+/// pass of the SAME call: the survey resolver's failure mode is a genuinely transient,
+/// attempts-incrementing defer, so a skip-set that reset every pass would silently let the
+/// re-fetch loop rediscover and re-attempt the same dependent row each time, still burning its
+/// `attempts` budget down to a false `.conflict` within the same `drain()` call, with zero real
+/// elapsed time and zero chance for a human to retry the elevation first.
 ///
 /// **Re-fetch until stable** (m4a-review Minor #5): a row enqueued *during* this call — e.g. a
 /// second `WorkLogActions.checkOut` from another view while this pass is mid-`await` — misses
@@ -260,6 +288,7 @@ final class OutboxWorker {
         defer { isDraining = false }
 
         var previouslyFetchedIDs: Set<PersistentIdentifier>?
+        var failedSurveyLocalIdsThisDrain: Set<String> = []
         for _ in 0..<Self.maxPassesPerDrain {
             guard !isHeld, !Task.isCancelled else { return }
 
@@ -269,7 +298,7 @@ final class OutboxWorker {
             if fetchedIDs == previouslyFetchedIDs { return }
             previouslyFetchedIDs = fetchedIDs
 
-            if await runPass(items) { return }
+            if await runPass(items, failedSurveyLocalIdsThisPass: &failedSurveyLocalIdsThisDrain) { return }
         }
     }
 
@@ -284,12 +313,23 @@ final class OutboxWorker {
     }
 
     /// One FIFO pass over `items` (a fetch snapshot `drain()` took at the top of a loop
-    /// iteration). Returns `true` when `drain()` should stop entirely rather than looping for
+    /// iteration). `failedSurveyLocalIdsThisPass` is an `inout` accumulator `drain()` owns and
+    /// threads through every internal pass of the SAME `drain()` invocation — never reset
+    /// mid-call, only fresh at the next external `drain()` call. This differs from
+    /// `failedWorkLogClientUuidsThisPass` below, which IS reset fresh every `runPass` call: that
+    /// set's harmless to reset per-pass because a dependent check-out's own failure mode (404 on
+    /// a nonexistent work log) is already an immediate permanent conflict, never attempts-gated.
+    /// The survey resolver's failure mode is a genuinely transient, attempts-incrementing defer
+    /// (`resolveServerId`), so a same-drain-scoped (not same-pass-scoped) accumulator is what
+    /// actually stops `drain()`'s internal re-fetch loop (class doc comment, "Same-pass
+    /// elevation dependency skip") from silently re-attempting — and re-bumping `attempts` for —
+    /// the same dependent row on every internal pass a permanently-failed `.elevationCreate`
+    /// triggers. Returns `true` when `drain()` should stop entirely rather than looping for
     /// another pass — a `network`/`401` transient failure (see the class doc comment) or a
     /// cancellation observed between items — `false` when the pass ran to completion (possibly
     /// with some rows deferred as an unresolved dependent, or left `.pending` for a bounded
     /// retry).
-    private func runPass(_ items: [SyncOutbox]) async -> Bool {
+    private func runPass(_ items: [SyncOutbox], failedSurveyLocalIdsThisPass: inout Set<String>) async -> Bool {
         var failedWorkLogClientUuidsThisPass: Set<String> = []
 
         for item in items {
@@ -299,6 +339,16 @@ final class OutboxWorker {
                 // This row's dependency (its check-in) didn't reach the server this pass —
                 // replaying it now would 404 into a permanent conflict it can never recover
                 // from on its own. Leave it exactly as fetched; it retries next pass.
+                continue
+            }
+
+            if let dependencyElevationId = elevationDependencyLocalId(for: item), failedSurveyLocalIdsThisPass.contains(dependencyElevationId) {
+                // This row's dependency (its elevation's `.elevationCreate`) didn't reach the
+                // server this pass — attempting it now would either 404 into a permanent
+                // conflict (plan §2 point 2) or, via the resolver, burn another `attempts` bump
+                // on the same dead dependency the create already reported this pass. Leave it
+                // exactly as fetched; it retries next pass, once the elevation itself has had a
+                // real chance to actually change (a later drain, or a manual retry).
                 continue
             }
 
@@ -318,6 +368,9 @@ final class OutboxWorker {
                 if let workLogUuid = workLogClientUuid(for: item) {
                     failedWorkLogClientUuidsThisPass.insert(workLogUuid)
                 }
+                if let elevationLocalId = elevationCreateLocalId(for: item) {
+                    failedSurveyLocalIdsThisPass.insert(elevationLocalId)
+                }
             case .transientFailure(let message, let stopsPass):
                 item.attempts += 1
                 item.lastError = message
@@ -325,6 +378,9 @@ final class OutboxWorker {
                 saveAndRefreshCounts()
                 if let workLogUuid = workLogClientUuid(for: item) {
                     failedWorkLogClientUuidsThisPass.insert(workLogUuid)
+                }
+                if item.state == OutboxState.conflict.rawValue, let elevationLocalId = elevationCreateLocalId(for: item) {
+                    failedSurveyLocalIdsThisPass.insert(elevationLocalId)
                 }
                 if stopsPass { return true }
             }
@@ -441,8 +497,25 @@ final class OutboxWorker {
             guard let surveyGateway else {
                 return .transientFailure("survey gateway not configured", stopsPass: false)
             }
+            // Resolve the elevation link at DISPATCH time, not enqueue time — the identical
+            // chain resolver `.surfaceCapture` uses below, generalized (plan §2/§5). Forwarding
+            // the raw local id (still a field-added elevation's `clientUuid` until its own
+            // `.elevationCreate` lands) straight into `POST /surfaces/{id}/assign` would 404 —
+            // a PERMANENT conflict per `classify`'s rules, for a row that was never actually
+            // wrong, just early. A `nil` resolution defers instead (transient, non-pass-
+            // stopping) BEFORE any network call. `buildingId` needs no resolution: `Building`
+            // is read-only on-device, so it's always already a real server id.
+            let localElevationId = payload.elevationId
+            let elevation = (try? modelContext.fetch(FetchDescriptor<Elevation>(
+                predicate: #Predicate<Elevation> { $0.id == localElevationId }
+            )))?.first
+            let resolvedElevationId: String
+            switch resolveServerId(from: elevation, entity: "elevation") {
+            case .resolved(let serverId): resolvedElevationId = serverId
+            case .deferred(let reason): return .transientFailure(reason, stopsPass: false)
+            }
             do {
-                try await surveyGateway.assignSurface(surfaceId: payload.surfaceId, buildingId: payload.buildingId, elevationId: payload.elevationId)
+                try await surveyGateway.assignSurface(surfaceId: payload.surfaceId, buildingId: payload.buildingId, elevationId: resolvedElevationId)
                 return .success
             } catch {
                 return classify(error)
@@ -499,6 +572,47 @@ final class OutboxWorker {
         case .checkOut:
             return (try? JSONDecoder().decode(CheckOutPayload.self, from: item.payload))?.workLogClientUuid
         case .photoUpload, .elevationCreate, .surfaceAssign, .surfaceCapture:
+            return nil
+        }
+    }
+
+    /// The LOCAL elevation id a just-failed `.elevationCreate` row is itself the create for —
+    /// `ElevationCreatePayload.clientUuid`, the same value `reconcileElevation` pins as
+    /// `Elevation.id` forever (see that method's doc comment). Used only to populate
+    /// `failedSurveyLocalIdsThisPass` (plan §5) when THIS exact row fails this pass — never to
+    /// check it; see `elevationDependencyLocalId(for:)` for the read side of that guard. `nil`
+    /// for every other endpoint: nothing else populates this set in this slice (a
+    /// `.surfaceCapture`'s own local id is a candidate for a later `.photoUpload(entityType:
+    /// "surface")` dependent, but that chain isn't wired here).
+    private func elevationCreateLocalId(for item: SyncOutbox) -> String? {
+        guard let endpoint = OutboxEndpoint(rawValue: item.endpoint) else { return nil }
+        switch endpoint {
+        case .elevationCreate:
+            return (try? JSONDecoder().decode(ElevationCreatePayload.self, from: item.payload))?.clientUuid
+        case .checkIn, .checkOut, .photoUpload, .surfaceAssign, .surfaceCapture:
+            return nil
+        }
+    }
+
+    /// The LOCAL elevation id a `.surfaceAssign`/`.surfaceCapture` row DEPENDS on — the exact
+    /// field `attempt()`'s own chain resolver looks up for each, read straight off the payload
+    /// here without a store fetch (plan §5's same-pass skip-set, one level down the chain from
+    /// `workLogClientUuid`). Checked against `failedSurveyLocalIdsThisPass` BEFORE either is
+    /// attempted. Deliberately one-directional — this is the row's DEPENDENCY, never its own
+    /// identity, so a `.surfaceAssign`/`.surfaceCapture` that itself fails for an unrelated
+    /// reason (e.g. a genuinely missing surface) never poisons some other row targeting the
+    /// same elevation; only `elevationCreateLocalId(for:)` ever populates the set. `nil` for a
+    /// `.surfaceCapture` captured directly onto a `Building` with no elevation link, and for
+    /// every other endpoint — neither has a same-pass elevation dependency to protect.
+    private func elevationDependencyLocalId(for item: SyncOutbox) -> String? {
+        guard let endpoint = OutboxEndpoint(rawValue: item.endpoint) else { return nil }
+        switch endpoint {
+        case .surfaceAssign:
+            return (try? JSONDecoder().decode(SurfaceAssignPayload.self, from: item.payload))?.elevationId
+        case .surfaceCapture:
+            guard let payload = try? JSONDecoder().decode(SurfaceCapturePayload.self, from: item.payload) else { return nil }
+            return payload.elevationId
+        case .checkIn, .checkOut, .photoUpload, .elevationCreate:
             return nil
         }
     }
@@ -657,7 +771,7 @@ final class OutboxWorker {
     }
 
     /// The shared 3-way resolution the M5b chain resolver applies to an ALREADY-fetched local
-    /// row (an `Elevation` for `.surfaceCapture`'s elevation link, a `Surface` for
+    /// row (an `Elevation` for `.surfaceAssign`'s/`.surfaceCapture`'s elevation link, a `Surface` for
     /// `.photoUpload`'s surface holder): `.resolved` only when the row exists AND has learned
     /// its `serverId`; otherwise `.deferred`, so the caller returns a non-pass-stopping
     /// transient failure BEFORE any network call — no wasted/incorrect request, self-healing on

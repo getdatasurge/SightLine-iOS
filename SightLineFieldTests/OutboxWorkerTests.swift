@@ -898,11 +898,15 @@ final class OutboxWorkerTests: XCTestCase {
         XCTAssertEqual(item.attempts, 1)
     }
 
-    // MARK: - drain(): .surfaceAssign (M5a)
+    // MARK: - drain(): .surfaceAssign (M5a) + chain resolver / same-pass skip-set (M5c)
 
-    func testDrainSurfaceAssignHappyPathPurgesRow() async throws {
+    func testDrainSurfaceAssignHappyPathResolvesElevationAndPurgesRow() async throws {
         let context = try makeContext()
         context.insert(Surface(id: "surf-1", jobId: "job-1", label: "Front door glass", status: "MEASURED", updatedAt: Date(timeIntervalSince1970: 1_000)))
+        context.insert(Elevation(
+            id: "elev-1", buildingId: "bldg-1", elevationNumber: 1, label: "North Wall", fieldAdded: true,
+            clientUuid: "elev-1", serverId: "srv-elev-1", updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
         insertSurfaceAssignItem(context: context, surfaceId: "surf-1", createdAt: Date(timeIntervalSince1970: 500))
         try context.save()
 
@@ -916,12 +920,16 @@ final class OutboxWorkerTests: XCTestCase {
         XCTAssertEqual(surveyGateway.assignSurfaceCalls.count, 1)
         XCTAssertEqual(surveyGateway.assignSurfaceCalls.first?.surfaceId, "surf-1")
         XCTAssertEqual(surveyGateway.assignSurfaceCalls.first?.buildingId, "bldg-1")
-        XCTAssertEqual(surveyGateway.assignSurfaceCalls.first?.elevationId, "elev-1")
+        XCTAssertEqual(surveyGateway.assignSurfaceCalls.first?.elevationId, "srv-elev-1", "the gateway must receive the RESOLVED server elevation id, never the local one")
         XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "a successfully-synced row is purged")
     }
 
     func testDrainSurfaceAssignIsIdempotentOnReplay() async throws {
         let context = try makeContext()
+        context.insert(Elevation(
+            id: "elev-1", buildingId: "bldg-1", elevationNumber: 1, label: "North Wall", fieldAdded: true,
+            clientUuid: "elev-1", serverId: "srv-elev-1", updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
         insertSurfaceAssignItem(context: context, surfaceId: "surf-1", createdAt: Date(timeIntervalSince1970: 500))
         try context.save()
 
@@ -939,6 +947,10 @@ final class OutboxWorkerTests: XCTestCase {
 
     func testDrainSurfaceAssignPermanentServerRejectionBecomesConflict() async throws {
         let context = try makeContext()
+        context.insert(Elevation(
+            id: "elev-1", buildingId: "bldg-1", elevationNumber: 1, label: "North Wall", fieldAdded: true,
+            clientUuid: "elev-1", serverId: "srv-elev-1", updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
         let item = insertSurfaceAssignItem(context: context, surfaceId: "surf-1", createdAt: Date(timeIntervalSince1970: 500))
         try context.save()
 
@@ -955,6 +967,10 @@ final class OutboxWorkerTests: XCTestCase {
 
     func testDrainSurfaceAssignNetworkErrorStaysPendingAndStopsPass() async throws {
         let context = try makeContext()
+        context.insert(Elevation(
+            id: "elev-1", buildingId: "bldg-1", elevationNumber: 1, label: "North Wall", fieldAdded: true,
+            clientUuid: "elev-1", serverId: "srv-elev-1", updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
         let first = insertSurfaceAssignItem(context: context, surfaceId: "surf-1", createdAt: Date(timeIntervalSince1970: 100))
         let second = insertSurfaceAssignItem(context: context, surfaceId: "surf-2", createdAt: Date(timeIntervalSince1970: 200))
         try context.save()
@@ -972,6 +988,119 @@ final class OutboxWorkerTests: XCTestCase {
         XCTAssertEqual(first.attempts, 1)
         XCTAssertEqual(second.state, OutboxState.pending.rawValue)
         XCTAssertEqual(second.attempts, 0)
+    }
+
+    func testDrainSurfaceAssignDefersWhenElevationNotYetSyncedThenSucceedsOnceServerIdSet() async throws {
+        let context = try makeContext()
+        let elevationLocalId = UUID().uuidString
+        // Field-added elevation whose own .elevationCreate hasn't landed yet: serverId still nil.
+        context.insert(Elevation(
+            id: elevationLocalId, buildingId: "bldg-1", elevationNumber: 1, label: "North Wall", fieldAdded: true,
+            clientUuid: elevationLocalId, serverId: nil, updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        context.insert(Surface(id: "surf-1", jobId: "job-1", label: "Front door glass", status: "MEASURED", updatedAt: Date(timeIntervalSince1970: 1_000)))
+        let item = insertSurfaceAssignItem(context: context, surfaceId: "surf-1", elevationId: elevationLocalId, createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let surveyGateway = FakeSurveyWriteGateway()
+        surveyGateway.assignSurfaceResult = .success(())
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surveyGateway = surveyGateway
+
+        // First drain: the parent elevation has no serverId yet, so the resolver short-circuits
+        // BEFORE any network call — proving it's not a post-404 defer (assert ZERO invocations).
+        await worker.drain()
+
+        XCTAssertTrue(surveyGateway.assignSurfaceCalls.isEmpty, "gateway must NEVER be called while the elevation link is unresolved")
+        XCTAssertEqual(item.state, OutboxState.pending.rawValue, "deferred, not conflicted")
+        XCTAssertEqual(item.attempts, 1, "one transient bump, self-heals next drain")
+
+        // The parent's own .elevationCreate now lands (simulate reconcileElevation setting serverId).
+        let elevation = try XCTUnwrap(try context.fetch(FetchDescriptor<Elevation>()).first)
+        elevation.serverId = "srv-elev-1"
+        try context.save()
+
+        await worker.drain()
+
+        XCTAssertEqual(surveyGateway.assignSurfaceCalls.count, 1, "now resolvable → dispatched exactly once")
+        XCTAssertEqual(surveyGateway.assignSurfaceCalls.first?.elevationId, "srv-elev-1", "dispatched with the now-known server id")
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "row purged after success")
+    }
+
+    func testDrainSurfaceAssignDefersWhenReferencedElevationMissingLocallyAndNeverCallsGateway() async throws {
+        let context = try makeContext()
+        context.insert(Surface(id: "surf-1", jobId: "job-1", label: "Front door glass", status: "MEASURED", updatedAt: Date(timeIntervalSince1970: 1_000)))
+        // elevationId points at an elevation that doesn't exist locally at all.
+        let item = insertSurfaceAssignItem(context: context, surfaceId: "surf-1", elevationId: "ghost-elev", createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let surveyGateway = FakeSurveyWriteGateway()
+        surveyGateway.assignSurfaceResult = .success(())
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surveyGateway = surveyGateway
+
+        await worker.drain()
+
+        XCTAssertTrue(surveyGateway.assignSurfaceCalls.isEmpty, "an unresolvable local link defers before any network call")
+        XCTAssertEqual(item.state, OutboxState.pending.rawValue)
+        XCTAssertEqual(item.attempts, 1)
+    }
+
+    /// The same-pass skip-set (plan §2 point 2 / §5): a `.surfaceAssign` whose target elevation
+    /// is field-added, and whose own `.elevationCreate` FAILS PERMANENTLY in this same
+    /// `drain()` pass, must be skipped outright — never attempted, never even bumped through the
+    /// resolver's own (already-correct) defer path. Without the skip-set, (1) alone would still
+    /// resolve to `nil` and return a non-pass-stopping transient failure, which increments
+    /// `attempts`; this test proves the skip is a true `continue` (zero attempts, zero gateway
+    /// calls), not merely "the resolver saves it from a bad network call".
+    func testDrainElevationCreatePermanentFailureSkipsSamePassSurfaceAssignThenSucceedsOnceElevationResolves() async throws {
+        let context = try makeContext()
+        let elevationClientUuid = UUID().uuidString
+        // Field-added elevation: optimistic row (id == clientUuid, serverId nil) + its own
+        // .elevationCreate queued FIRST (earlier createdAt) — FIFO-earlier than the dependent
+        // assign, exactly as ElevationActions/SurfaceActions guarantee in practice.
+        context.insert(Elevation(
+            id: elevationClientUuid, buildingId: "bldg-1", elevationNumber: 1, label: "North Wall", fieldAdded: true,
+            clientUuid: elevationClientUuid, serverId: nil, updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        let elevationCreateItem = insertElevationCreateItem(context: context, clientUuid: elevationClientUuid, createdAt: Date(timeIntervalSince1970: 100))
+        // A surface assigned onto that same field-added elevation the same session —
+        // .surfaceAssign queued SECOND, same pass.
+        context.insert(Surface(id: "surf-1", jobId: "job-1", label: "Front door glass", status: "MEASURED", updatedAt: Date(timeIntervalSince1970: 1_000)))
+        let assignItem = insertSurfaceAssignItem(context: context, surfaceId: "surf-1", elevationId: elevationClientUuid, createdAt: Date(timeIntervalSince1970: 200))
+        try context.save()
+
+        let surveyGateway = FakeSurveyWriteGateway()
+        surveyGateway.createElevationResult = .failure(ApiError.server(status: 400)) // permanent 4xx
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surveyGateway = surveyGateway
+
+        // ONE drain: .elevationCreate fails permanently, populating failedSurveyLocalIdsThisPass;
+        // the dependent .surfaceAssign in the SAME pass must be skipped outright, not attempted.
+        await worker.drain()
+
+        XCTAssertEqual(surveyGateway.createElevationCalls.count, 1)
+        XCTAssertEqual(elevationCreateItem.state, OutboxState.conflict.rawValue)
+        XCTAssertEqual(elevationCreateItem.attempts, 0, "a 4xx rejection never even burns an attempt")
+
+        XCTAssertTrue(surveyGateway.assignSurfaceCalls.isEmpty, "the dependent assign must never reach the gateway this pass")
+        XCTAssertEqual(assignItem.state, OutboxState.pending.rawValue, "skipped, not attempted-then-deferred")
+        XCTAssertEqual(assignItem.attempts, 0, "SKIPPED means zero attempts increment — this is the whole point of the guard")
+
+        // The elevation's own create eventually lands by some other means (manual retry +
+        // resync, or the office fixing whatever the 400 was about) — its serverId becomes known.
+        let elevation = try XCTUnwrap(try context.fetch(FetchDescriptor<Elevation>()).first)
+        elevation.serverId = "srv-elev-1"
+        try context.save()
+
+        // The still-conflicted .elevationCreate row is excluded from the next fetch (only
+        // .pending/.inFlight rows are drained); only the still-pending .surfaceAssign is picked up.
+        await worker.drain()
+
+        XCTAssertEqual(surveyGateway.assignSurfaceCalls.count, 1, "no longer skipped — the dependency is resolved now")
+        XCTAssertEqual(surveyGateway.assignSurfaceCalls.first?.elevationId, "srv-elev-1")
+        XCTAssertEqual(worker.pendingCount, 0)
+        XCTAssertEqual(worker.conflictCount, 1, "the elevationCreate row itself is still conflicted — a separate, already-covered concern")
     }
 
     // MARK: - drain(): .surfaceCapture (M5b) + chain resolver
