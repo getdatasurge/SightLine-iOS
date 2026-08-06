@@ -1,15 +1,20 @@
 import SwiftData
 import SwiftUI
 
-/// Read-only building/elevation hierarchy for one job (M5a). A job's buildings are almost
-/// always estimator-created on the web before a technician arrives — this slice only surfaces
-/// what `SyncEngine.syncBuildings()` has already pulled down; no add/assign UI yet (see
-/// `SurveyModels.swift`'s file doc comment for the write lane this defers to).
+/// Building/elevation hierarchy for one job (M5a). A job's buildings are almost always
+/// estimator-created on the web before a technician arrives — this view surfaces what
+/// `SyncEngine.syncBuildings()` has pulled down, plus lets a technician add a field-discovered
+/// elevation per building (`AddElevationSheet` → `ElevationActions.addElevation`). Pane→elevation
+/// assignment isn't here: panes are listed in `JobDetailView`'s "Surfaces" section, not this one,
+/// so that's where the assign affordance belongs (deferred — see `SurveyModels.swift`'s file doc
+/// comment).
 @MainActor
 struct JobElevationsView: View {
     let jobId: String
 
     @Query private var buildings: [Building]
+
+    @State private var addElevationTarget: Building?
 
     /// Mirrors `JobDetailView.init(job:)`: the filter closure captures the plain `jobId`
     /// parameter (not `self.jobId`) so `#Predicate` doesn't need to capture `self`.
@@ -27,12 +32,21 @@ struct JobElevationsView: View {
                     ForEach(buildings) { building in
                         Section(building.name) {
                             BuildingElevationRows(buildingId: building.id)
+                            Button {
+                                addElevationTarget = building
+                            } label: {
+                                Label("Add Elevation", systemImage: "plus")
+                                    .font(DS.Font.body)
+                            }
                         }
                     }
                 }
             }
         }
         .navigationTitle("Buildings")
+        .sheet(item: $addElevationTarget) { building in
+            AddElevationSheet(buildingId: building.id)
+        }
     }
 }
 
