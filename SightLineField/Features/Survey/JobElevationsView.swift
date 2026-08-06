@@ -7,14 +7,16 @@ import SwiftUI
 /// elevation per building (`AddElevationSheet` → `ElevationActions.addElevation`), and lets
 /// them capture a measured pane onto an elevation (`CaptureSurfaceSheet` →
 /// `SurfaceActions.captureSurface`, M5b). Pane assignment/listing beyond capture isn't here:
-/// panes are listed in `JobDetailView`'s "Surfaces" section, not this one, so the
-/// assign-existing-surface affordance belongs there (deferred — see `SurveyModels.swift`'s file
-/// doc comment).
+/// panes are listed in `JobDetailView`'s "Surfaces" section, not this one — that section (M5c)
+/// is where the assign-existing-surface affordance now lives (`AssignSurfaceSheet` →
+/// `ElevationActions.assignSurface`), picking a building/elevation from the same hierarchy this
+/// view renders.
 @MainActor
 struct JobElevationsView: View {
     let jobId: String
 
     @Query private var buildings: [Building]
+    @Query(sort: \Elevation.elevationNumber) private var allElevations: [Elevation]
 
     @State private var addElevationTarget: Building?
     @State private var captureTarget: Elevation?
@@ -26,6 +28,18 @@ struct JobElevationsView: View {
         _buildings = Query(filter: #Predicate<Building> { $0.jobId == jobId }, sort: [SortDescriptor(\.buildingIndex)])
     }
 
+    /// Elevations grouped by `buildingId`, computed from one flat, unfiltered `@Query` instead
+    /// of a nested per-building query (M5c, UITest-determinism fix): a single `@Query` observer
+    /// re-diffs once per store change instead of once per building, so a background
+    /// `SyncEngine.syncBuildings()` save landing mid-`.sheet` transition no longer triggers N
+    /// independent re-renders competing with the sheet's own dismiss animation. Grouping the
+    /// whole local `Elevation` table client-side is cheap at this app's actual scale (one
+    /// technician's currently-synced jobs, not a system-wide dataset) — `Dictionary(grouping:)`
+    /// preserves `allElevations`' own sort order within each building's array.
+    private var elevationsByBuilding: [String: [Elevation]] {
+        Dictionary(grouping: allElevations, by: \.buildingId)
+    }
+
     var body: some View {
         Group {
             if buildings.isEmpty {
@@ -34,7 +48,7 @@ struct JobElevationsView: View {
                 List {
                     ForEach(buildings) { building in
                         Section(building.name) {
-                            BuildingElevationRows(buildingId: building.id) { elevation in
+                            BuildingElevationRows(elevations: elevationsByBuilding[building.id] ?? []) { elevation in
                                 captureTarget = elevation
                             }
                             Button {
@@ -58,16 +72,12 @@ struct JobElevationsView: View {
     }
 }
 
-/// One building's elevation rows, queried independently by `buildingId` so each section updates
-/// on its own instead of the parent view holding every elevation across every building.
+/// One building's elevation rows — a plain array (M5c), not its own `@Query`: grouping happens
+/// once at `JobElevationsView.elevationsByBuilding` from a single flat query, so this view is
+/// just a renderer with no independent store observer of its own to re-diff mid-transition.
 private struct BuildingElevationRows: View {
-    @Query private var elevations: [Elevation]
+    let elevations: [Elevation]
     let onCapture: (Elevation) -> Void
-
-    init(buildingId: String, onCapture: @escaping (Elevation) -> Void) {
-        _elevations = Query(filter: #Predicate<Elevation> { $0.buildingId == buildingId }, sort: [SortDescriptor(\.elevationNumber)])
-        self.onCapture = onCapture
-    }
 
     var body: some View {
         if elevations.isEmpty {
@@ -105,6 +115,7 @@ private struct ElevationRow: View {
                         .foregroundStyle(DS.Color.textSecondary)
                 }
             }
+            .accessibilityElement(children: .combine)
             Spacer()
             if elevation.fieldAdded {
                 FieldAddedBadge()
@@ -117,6 +128,8 @@ private struct ElevationRow: View {
                     .font(DS.Font.body)
             }
             .buttonStyle(.borderless)
+            .frame(minWidth: DS.Layout.minTouchTarget, minHeight: DS.Layout.minTouchTarget)
+            .contentShape(Rectangle())
         }
     }
 }

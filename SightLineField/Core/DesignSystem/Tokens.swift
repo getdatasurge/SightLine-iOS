@@ -86,6 +86,15 @@ enum DS {
         /// SwiftUI's "caption" role (DESIGN.md has no literal "caption" token).
         static let caption = SwiftUI.Font.custom("IBM Plex Sans", size: 12).weight(.medium)
     }
+
+    /// HIG minimum tappable-control size (44×44pt, `reference/ios.md`'s "Touch targets"
+    /// floor). Additive M5c token — reused by every icon-only per-row action on the survey
+    /// screens (`JobElevationsView`'s "Capture Pane", `JobDetailView`'s per-surface "Assign
+    /// to Elevation"/"Add Photo") so a small SF Symbol glyph never renders a smaller hit
+    /// target than HIG requires, regardless of the glyph's own intrinsic size.
+    enum Layout {
+        static let minTouchTarget: CGFloat = 44
+    }
 }
 
 private extension SwiftUI.Color {

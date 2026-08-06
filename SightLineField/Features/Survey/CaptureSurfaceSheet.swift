@@ -35,12 +35,24 @@ struct CaptureSurfaceSheet: View {
             || !((Double(heightText) ?? 0) > 0)
     }
 
+    /// Shown under "Dimensions" only once the technician has typed *something* for width or
+    /// height that isn't a valid positive measurement — an empty field is self-evidently
+    /// unfinished and doesn't need explaining, but "0" or "-4" silently keeping Capture
+    /// disabled does.
+    private var invalidDimensionsHint: String? {
+        let widthInvalid = !widthText.isEmpty && !((Double(widthText) ?? 0) > 0)
+        let heightInvalid = !heightText.isEmpty && !((Double(heightText) ?? 0) > 0)
+        guard widthInvalid || heightInvalid else { return nil }
+        return "Width and height must be greater than zero."
+    }
+
     var body: some View {
         NavigationStack {
             Form {
                 Section {
                     TextField("Label", text: $label)
                         .font(DS.Font.body)
+                        .submitLabel(.done)
                 }
                 Section {
                     TextField("Width (in)", text: $widthText)
@@ -59,14 +71,27 @@ struct CaptureSurfaceSheet: View {
                             Text(fraction).tag(fraction)
                         }
                     }
+                } header: {
+                    Text("Dimensions")
+                } footer: {
+                    if let invalidDimensionsHint {
+                        Text(invalidDimensionsHint)
+                            .font(DS.Font.caption)
+                            .foregroundStyle(DS.Color.textSecondary)
+                    }
                 }
-                Section {
+                Section("Details") {
                     Stepper("Quantity: \(quantity)", value: $quantity, in: 1...999)
+                        .accessibilityIdentifier("capture-quantity-stepper")
                     TextField("Glass Type (optional)", text: $glassType)
                         .font(DS.Font.body)
+                        .submitLabel(.done)
                 }
             }
             .navigationTitle("Capture Pane")
+            .onSubmit {
+                if !isCaptureDisabled { confirm() }
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }

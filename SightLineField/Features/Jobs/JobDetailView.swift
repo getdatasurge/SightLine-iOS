@@ -24,6 +24,7 @@ struct JobDetailView: View {
     @State private var isCheckInPresented = false
     @State private var checkOutTarget: WorkLog?
     @State private var pickerItem: PhotosPickerItem?
+    @State private var assignTarget: Surface?
 
     init(job: JobSummary) {
         self.job = job
@@ -104,13 +105,7 @@ struct JobDetailView: View {
                         .listRowInsets(EdgeInsets())
                 } else {
                     ForEach(surfaces) { surface in
-                        HStack {
-                            Text(surface.label)
-                                .font(DS.Font.body)
-                                .foregroundStyle(DS.Color.textPrimary)
-                            Spacer()
-                            SurfaceStatusChip(status: surface.status)
-                        }
+                        SurfaceRow(surface: surface, onAssign: { assignTarget = $0 })
                     }
                 }
 
@@ -130,22 +125,34 @@ struct JobDetailView: View {
         .sheet(item: $checkOutTarget) { workLog in
             CheckOutSheet(workLog: workLog)
         }
+        .sheet(item: $assignTarget) { surface in
+            AssignSurfaceSheet(jobId: job.id, surface: surface)
+        }
         .onChange(of: pickerItem) { _, newItem in
-            loadAndEnqueue(newItem)
+            Task {
+                if await Self.loadAndEnqueue(newItem, entityType: "job", entityId: job.id, photoActions: photoActions) {
+                    pickerItem = nil
+                }
+            }
         }
     }
 
-    /// Loads the picked item's raw bytes, converts to JPEG, and hands off to `PhotoActions` —
-    /// offline-first (mirrors `checkIn`/`checkOut`): no error UI on a failed load, matching the
-    /// "never shows an error" contract for this optimistic capture flow. Resets `pickerItem` to
-    /// `nil` afterward so picking the exact same asset again still fires `.onChange`.
-    private func loadAndEnqueue(_ item: PhotosPickerItem?) {
-        guard let item else { return }
-        Task {
-            guard let data = try? await item.loadTransferable(type: Data.self) else { return }
-            photoActions.enqueuePhoto(entityType: "job", entityId: job.id, imageData: Self.jpegData(from: data))
-            pickerItem = nil
-        }
+    /// Shared by the job-level "Add Photo" picker above and each `SurfaceRow`'s per-pane
+    /// picker below: loads `item`'s raw bytes, converts to JPEG (`jpegData(from:)`), and hands
+    /// off to `PhotoActions` — offline-first (mirrors `checkIn`/`checkOut`): no error UI on a
+    /// failed load, matching the "never shows an error" contract for this optimistic capture
+    /// flow. Returns whether the enqueue happened, so each call site resets its own
+    /// `PhotosPickerItem` selection only on success — picking the exact same asset again after
+    /// a failed load still needs a distinct value to re-fire `.onChange`.
+    fileprivate static func loadAndEnqueue(
+        _ item: PhotosPickerItem?,
+        entityType: String,
+        entityId: String,
+        photoActions: PhotoActions
+    ) async -> Bool {
+        guard let item, let data = try? await item.loadTransferable(type: Data.self) else { return false }
+        photoActions.enqueuePhoto(entityType: entityType, entityId: entityId, imageData: jpegData(from: data))
+        return true
     }
 
     /// `PhotosPickerItem.loadTransferable(type: Data.self)` hands back whatever encoding the
@@ -160,6 +167,71 @@ struct JobDetailView: View {
         }
         #endif
         return data
+    }
+}
+
+/// One `Surface` row in `JobDetailView`'s "Surfaces" section (M5c). Combines the read-only
+/// label/status line with two per-row actions: "Assign to Elevation" (shown only while
+/// unassigned — opens `AssignSurfaceSheet`, which calls `ElevationActions.assignSurface`) and
+/// "Add Photo" (always available — `PhotoActions.enqueuePhoto(entityType: "surface", ...)` via
+/// the same load-convert-to-JPEG flow the job-level Photos section uses, through
+/// `JobDetailView.loadAndEnqueue`). The trailing icon-button convention matches
+/// `JobElevationsView.ElevationRow`'s "Capture Pane" action, so both survey screens share one
+/// affordance vocabulary.
+private struct SurfaceRow: View {
+    let surface: Surface
+    let onAssign: (Surface) -> Void
+
+    @Environment(PhotoActions.self) private var photoActions
+    @State private var pickerItem: PhotosPickerItem?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(surface.label)
+                    .font(DS.Font.body)
+                    .foregroundStyle(DS.Color.textPrimary)
+                Spacer()
+                SurfaceStatusChip(status: surface.status)
+            }
+            .accessibilityElement(children: .combine)
+
+            HStack {
+                if surface.elevationId == nil {
+                    Button {
+                        onAssign(surface)
+                    } label: {
+                        Label("Assign to Elevation", systemImage: "building.2")
+                            .font(DS.Font.caption)
+                    }
+                    .buttonStyle(.borderless)
+                    .frame(minHeight: DS.Layout.minTouchTarget)
+                    .contentShape(Rectangle())
+                } else {
+                    Label("Assigned", systemImage: "checkmark.circle")
+                        .font(DS.Font.caption)
+                        .foregroundStyle(DS.Color.textSecondary)
+                }
+
+                Spacer(minLength: 8)
+
+                PhotosPicker(selection: $pickerItem, matching: .images) {
+                    Label("Add Photo", systemImage: "camera")
+                        .labelStyle(.iconOnly)
+                        .font(DS.Font.body)
+                }
+                .frame(minWidth: DS.Layout.minTouchTarget, minHeight: DS.Layout.minTouchTarget)
+                .contentShape(Rectangle())
+            }
+        }
+        .padding(.vertical, 4)
+        .onChange(of: pickerItem) { _, newItem in
+            Task {
+                if await JobDetailView.loadAndEnqueue(newItem, entityType: "surface", entityId: surface.id, photoActions: photoActions) {
+                    pickerItem = nil
+                }
+            }
+        }
     }
 }
 

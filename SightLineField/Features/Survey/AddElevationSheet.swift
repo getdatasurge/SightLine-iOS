@@ -15,6 +15,10 @@ struct AddElevationSheet: View {
     @State private var label = ""
     @State private var selectedFacing: String?
 
+    private var isAddDisabled: Bool {
+        label.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
     /// 16-point compass. `Elevation.facing` is a free-form string server-side (see
     /// `openapi.json`'s `facing` schema — plain `string`, no enum), so this is a picker
     /// vocabulary for the field tech rather than a validated set the model enforces.
@@ -29,6 +33,7 @@ struct AddElevationSheet: View {
                 Section {
                     TextField("Label", text: $label)
                         .font(DS.Font.body)
+                        .submitLabel(.done)
                     Picker("Facing", selection: $selectedFacing) {
                         Text("None").tag(nil as String?)
                         ForEach(Self.compassPoints, id: \.self) { point in
@@ -38,13 +43,16 @@ struct AddElevationSheet: View {
                 }
             }
             .navigationTitle("Add Elevation")
+            .onSubmit {
+                if !isAddDisabled { confirm() }
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Add") { confirm() }
-                        .disabled(label.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .disabled(isAddDisabled)
                 }
             }
         }
