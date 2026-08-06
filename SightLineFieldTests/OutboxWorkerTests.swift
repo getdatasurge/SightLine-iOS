@@ -67,6 +67,25 @@ final class FakeSurveyWriteGateway: SurveyWriteGateway, @unchecked Sendable {
     }
 }
 
+/// Fakes `SurfaceCaptureGateway` for direct `OutboxWorker.drain()` testing (M5b) — mirrors
+/// `FakeSurveyWriteGateway`'s shape/reasoning exactly. `captureCalls` records the `elevationId`
+/// it was actually handed so the chain-resolver tests can assert it saw the RESOLVED server id
+/// (or was never called at all when the parent was unresolved).
+final class FakeSurfaceCaptureGateway: SurfaceCaptureGateway, @unchecked Sendable {
+    var captureResult: Result<SurfaceCaptureDTO, Error> = .failure(ApiError.decoding)
+
+    private(set) var captureCalls: [(jobId: String, label: String, widthIn: Double, heightIn: Double, widthFraction: String?, heightFraction: String?, quantity: Int?, glassType: String?, buildingId: String?, elevationId: String?, clientUuid: String)] = []
+
+    func captureSurface(
+        jobId: String, label: String, widthIn: Double, heightIn: Double,
+        widthFraction: String?, heightFraction: String?, quantity: Int?, glassType: String?,
+        buildingId: String?, elevationId: String?, clientUuid: String
+    ) async throws -> SurfaceCaptureDTO {
+        captureCalls.append((jobId, label, widthIn, heightIn, widthFraction, heightFraction, quantity, glassType, buildingId, elevationId, clientUuid))
+        return try captureResult.get()
+    }
+}
+
 @MainActor
 final class OutboxWorkerTests: XCTestCase {
     func makeContext() throws -> ModelContext {
@@ -708,6 +727,51 @@ final class OutboxWorkerTests: XCTestCase {
         return item
     }
 
+    private func surfaceCaptureDto(
+        id: String,
+        label: String = "Front Door Glass",
+        status: String = "MEASURED",
+        widthIn: Double? = 24,
+        heightIn: Double? = 36,
+        widthFraction: String? = nil,
+        heightFraction: String? = nil,
+        quantity: Int? = 1,
+        glassType: String? = nil,
+        areaSqFt: Double? = 6.0,
+        buildingId: String? = nil,
+        elevationId: String? = nil,
+        roomId: String? = nil,
+        clientUuid: String? = nil,
+        updatedAt: Date = Date(timeIntervalSince1970: 2_000)
+    ) -> SurfaceCaptureDTO {
+        SurfaceCaptureDTO(
+            id: id, label: label, status: status, widthIn: widthIn, heightIn: heightIn,
+            widthFraction: widthFraction, heightFraction: heightFraction, quantity: quantity,
+            glassType: glassType, areaSqFt: areaSqFt, buildingId: buildingId, elevationId: elevationId,
+            roomId: roomId, clientUuid: clientUuid, updatedAt: updatedAt
+        )
+    }
+
+    @discardableResult
+    private func insertSurfaceCaptureItem(
+        context: ModelContext, jobId: String = "job-1", label: String = "Front Door Glass",
+        widthIn: Double = 24, heightIn: Double = 36, widthFraction: String? = nil, heightFraction: String? = nil,
+        quantity: Int? = 1, glassType: String? = nil, buildingId: String? = nil, elevationId: String?,
+        clientUuid: String, attempts: Int = 0, state: OutboxState = .pending, createdAt: Date
+    ) -> SyncOutbox {
+        let payload = SurfaceCapturePayload(
+            jobId: jobId, label: label, widthIn: widthIn, heightIn: heightIn,
+            widthFraction: widthFraction, heightFraction: heightFraction, quantity: quantity,
+            glassType: glassType, buildingId: buildingId, elevationId: elevationId, clientUuid: clientUuid
+        )
+        let item = SyncOutbox(
+            clientUuid: UUID().uuidString, endpoint: OutboxEndpoint.surfaceCapture.rawValue,
+            payload: try! JSONEncoder().encode(payload), attempts: attempts, state: state.rawValue, createdAt: createdAt
+        )
+        context.insert(item)
+        return item
+    }
+
     func testDrainElevationCreateHappyPathPurgesRowAndReconcilesLocalElevation() async throws {
         let context = try makeContext()
         let clientUuid = UUID().uuidString
@@ -909,6 +973,199 @@ final class OutboxWorkerTests: XCTestCase {
         XCTAssertEqual(second.state, OutboxState.pending.rawValue)
         XCTAssertEqual(second.attempts, 0)
     }
+
+    // MARK: - drain(): .surfaceCapture (M5b) + chain resolver
+
+    func testDrainSurfaceCaptureHappyPathResolvesElevationReconcilesAndPurges() async throws {
+        let context = try makeContext()
+        let elevationLocalId = UUID().uuidString
+        context.insert(Elevation(
+            id: elevationLocalId, buildingId: "bldg-1", elevationNumber: 1, label: "North Wall", fieldAdded: true,
+            clientUuid: elevationLocalId, serverId: "srv-elev-1", updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        let surfaceClientUuid = UUID().uuidString
+        context.insert(Surface(
+            id: surfaceClientUuid, jobId: "job-1", label: "Front Door Glass", status: "MEASURED",
+            buildingId: "bldg-1", elevationId: elevationLocalId, clientUuid: surfaceClientUuid, updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        insertSurfaceCaptureItem(context: context, buildingId: "bldg-1", elevationId: elevationLocalId, clientUuid: surfaceClientUuid, createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let surfaceGateway = FakeSurfaceCaptureGateway()
+        surfaceGateway.captureResult = .success(surfaceCaptureDto(
+            id: "srv-surf-1", status: "MEASURED", areaSqFt: 6.0, buildingId: "bldg-1", elevationId: "srv-elev-1",
+            clientUuid: surfaceClientUuid, updatedAt: Date(timeIntervalSince1970: 2_000)
+        ))
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surfaceCaptureGateway = surfaceGateway
+
+        await worker.drain()
+
+        XCTAssertEqual(surfaceGateway.captureCalls.count, 1)
+        XCTAssertEqual(surfaceGateway.captureCalls.first?.elevationId, "srv-elev-1", "the gateway must receive the RESOLVED server elevation id, never the local one")
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "a successfully-synced row is purged")
+
+        let surfaces = try context.fetch(FetchDescriptor<Surface>())
+        XCTAssertEqual(surfaces.count, 1, "reconcile updates in place, never duplicates")
+        let surface = try XCTUnwrap(surfaces.first)
+        XCTAssertEqual(surface.id, surfaceClientUuid, "id stays pinned to clientUuid")
+        XCTAssertEqual(surface.serverId, "srv-surf-1", "reconcileSurface persists the server's real id — the value the photo chain resolver keys off")
+        XCTAssertEqual(surface.areaSqFt, 6.0, "server-computed area lands via reconcile")
+        XCTAssertEqual(surface.status, "MEASURED")
+        XCTAssertEqual(surface.updatedAt, Date(timeIntervalSince1970: 2_000))
+    }
+
+    func testDrainSurfaceCaptureInsertsRowWhenNoLocalOptimisticWriteExists() async throws {
+        let context = try makeContext()
+        let surfaceClientUuid = UUID().uuidString
+        insertSurfaceCaptureItem(context: context, jobId: "job-7", elevationId: nil, clientUuid: surfaceClientUuid, createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let surfaceGateway = FakeSurfaceCaptureGateway()
+        surfaceGateway.captureResult = .success(surfaceCaptureDto(id: "srv-surf-1", clientUuid: surfaceClientUuid))
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surfaceCaptureGateway = surfaceGateway
+
+        await worker.drain()
+
+        let surfaces = try context.fetch(FetchDescriptor<Surface>())
+        XCTAssertEqual(surfaces.count, 1)
+        XCTAssertEqual(surfaces.first?.id, surfaceClientUuid)
+        XCTAssertEqual(surfaces.first?.jobId, "job-7", "the fallback insert threads jobId from the payload (the capture DTO carries none)")
+        XCTAssertEqual(surfaces.first?.serverId, "srv-surf-1")
+    }
+
+    func testDrainSurfaceCaptureDefersWhenElevationNotYetSyncedThenSucceedsOnceServerIdSet() async throws {
+        let context = try makeContext()
+        let elevationLocalId = UUID().uuidString
+        // Field-added elevation whose own .elevationCreate hasn't landed yet: serverId still nil.
+        context.insert(Elevation(
+            id: elevationLocalId, buildingId: "bldg-1", elevationNumber: 1, label: "North Wall", fieldAdded: true,
+            clientUuid: elevationLocalId, serverId: nil, updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        let surfaceClientUuid = UUID().uuidString
+        context.insert(Surface(
+            id: surfaceClientUuid, jobId: "job-1", label: "Pane", status: "MEASURED",
+            elevationId: elevationLocalId, clientUuid: surfaceClientUuid, updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        let item = insertSurfaceCaptureItem(context: context, elevationId: elevationLocalId, clientUuid: surfaceClientUuid, createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let surfaceGateway = FakeSurfaceCaptureGateway()
+        surfaceGateway.captureResult = .success(surfaceCaptureDto(id: "srv-surf-1", elevationId: "srv-elev-1", clientUuid: surfaceClientUuid))
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surfaceCaptureGateway = surfaceGateway
+
+        // First drain: the parent elevation has no serverId yet, so the resolver short-circuits
+        // BEFORE any network call — proving it's not a post-404 defer (assert ZERO invocations).
+        await worker.drain()
+
+        XCTAssertTrue(surfaceGateway.captureCalls.isEmpty, "gateway must NEVER be called while the elevation link is unresolved")
+        XCTAssertEqual(item.state, OutboxState.pending.rawValue, "deferred, not conflicted")
+        XCTAssertEqual(item.attempts, 1, "one transient bump, self-heals next drain")
+        XCTAssertNil(try context.fetch(FetchDescriptor<Surface>()).first?.serverId, "surface not reconciled yet")
+
+        // The parent's own .elevationCreate now lands (simulate reconcileElevation setting serverId).
+        let elevation = try XCTUnwrap(try context.fetch(FetchDescriptor<Elevation>()).first)
+        elevation.serverId = "srv-elev-1"
+        try context.save()
+
+        await worker.drain()
+
+        XCTAssertEqual(surfaceGateway.captureCalls.count, 1, "now resolvable → dispatched exactly once")
+        XCTAssertEqual(surfaceGateway.captureCalls.first?.elevationId, "srv-elev-1", "dispatched with the now-known server id")
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "row purged after success")
+        XCTAssertEqual(try context.fetch(FetchDescriptor<Surface>()).first?.serverId, "srv-surf-1")
+    }
+
+    func testDrainElevationCreateThenSurfaceCaptureBothResolveInOneFifoPass() async throws {
+        let context = try makeContext()
+        let elevationClientUuid = UUID().uuidString
+        // Field-added elevation: optimistic row (id == clientUuid, serverId nil) + its own
+        // .elevationCreate queued FIRST (earlier createdAt).
+        context.insert(Elevation(
+            id: elevationClientUuid, buildingId: "bldg-1", elevationNumber: 1, label: "North Wall", fieldAdded: true,
+            clientUuid: elevationClientUuid, serverId: nil, updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        insertElevationCreateItem(context: context, clientUuid: elevationClientUuid, createdAt: Date(timeIntervalSince1970: 100))
+        // A pane captured onto that same elevation the same session — .surfaceCapture queued SECOND.
+        let surfaceClientUuid = UUID().uuidString
+        context.insert(Surface(
+            id: surfaceClientUuid, jobId: "job-1", label: "Pane", status: "MEASURED",
+            elevationId: elevationClientUuid, clientUuid: surfaceClientUuid, updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        insertSurfaceCaptureItem(context: context, elevationId: elevationClientUuid, clientUuid: surfaceClientUuid, createdAt: Date(timeIntervalSince1970: 200))
+        try context.save()
+
+        let surveyGateway = FakeSurveyWriteGateway()
+        surveyGateway.createElevationResult = .success(elevationDto(id: "srv-elev-1", clientUuid: elevationClientUuid))
+        let surfaceGateway = FakeSurfaceCaptureGateway()
+        surfaceGateway.captureResult = .success(surfaceCaptureDto(id: "srv-surf-1", elevationId: "srv-elev-1", clientUuid: surfaceClientUuid))
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surveyGateway = surveyGateway
+        worker.surfaceCaptureGateway = surfaceGateway
+
+        // ONE drain: FIFO processes .elevationCreate first (its reconcile sets Elevation.serverId),
+        // so the later .surfaceCapture resolves in the SAME pass — no pre-pass skip set needed.
+        await worker.drain()
+
+        XCTAssertEqual(surveyGateway.createElevationCalls.count, 1)
+        XCTAssertEqual(surfaceGateway.captureCalls.count, 1, "the dependent capture resolves in the same pass its parent create landed")
+        XCTAssertEqual(surfaceGateway.captureCalls.first?.elevationId, "srv-elev-1", "resolved from the serverId the earlier .elevationCreate just persisted")
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "both rows succeed and are purged in one pass")
+
+        XCTAssertEqual(try context.fetch(FetchDescriptor<Elevation>()).first?.serverId, "srv-elev-1")
+        XCTAssertEqual(try context.fetch(FetchDescriptor<Surface>()).first?.serverId, "srv-surf-1")
+    }
+
+    func testDrainSurfaceCaptureConflictBecomesConflictImmediately() async throws {
+        let context = try makeContext()
+        let item = insertSurfaceCaptureItem(context: context, elevationId: nil, clientUuid: UUID().uuidString, createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let surfaceGateway = FakeSurfaceCaptureGateway()
+        surfaceGateway.captureResult = .failure(ApiError.server(status: 409))
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surfaceCaptureGateway = surfaceGateway
+
+        await worker.drain()
+
+        XCTAssertEqual(item.state, OutboxState.conflict.rawValue, "409 (job-site-required) is a permanent conflict — retrying can't fix a missing site")
+        XCTAssertEqual(item.attempts, 0, "a 4xx rejection never even burns an attempt")
+    }
+
+    func testDrainSurfaceCaptureWithNoGatewayConfiguredStaysPendingWithoutStoppingThePass() async throws {
+        let context = try makeContext()
+        let item = insertSurfaceCaptureItem(context: context, elevationId: nil, clientUuid: UUID().uuidString, createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        // surfaceCaptureGateway deliberately left nil.
+
+        await worker.drain()
+
+        XCTAssertEqual(item.state, OutboxState.pending.rawValue)
+        XCTAssertEqual(item.attempts, 1)
+    }
+
+    func testDrainSurfaceCaptureDefersWhenReferencedElevationMissingLocallyAndNeverCallsGateway() async throws {
+        let context = try makeContext()
+        let surfaceClientUuid = UUID().uuidString
+        // elevationId points at an elevation that doesn't exist locally at all.
+        let item = insertSurfaceCaptureItem(context: context, elevationId: "ghost-elev", clientUuid: surfaceClientUuid, createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let surfaceGateway = FakeSurfaceCaptureGateway()
+        surfaceGateway.captureResult = .success(surfaceCaptureDto(id: "srv-surf-1", clientUuid: surfaceClientUuid))
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surfaceCaptureGateway = surfaceGateway
+
+        await worker.drain()
+
+        XCTAssertTrue(surfaceGateway.captureCalls.isEmpty, "an unresolvable local link defers before any network call")
+        XCTAssertEqual(item.state, OutboxState.pending.rawValue)
+        XCTAssertEqual(item.attempts, 1)
+    }
 }
 
 // MARK: - SyncEngine.syncWorkLogs clientUuid dedup (M4 A-I4)
@@ -1013,5 +1270,104 @@ final class SyncEngineWorkLogDedupTests: XCTestCase {
         XCTAssertEqual(workLogs.count, 1)
         XCTAssertEqual(workLogs.first?.id, workLogClientUuid, "fresh insert keys by clientUuid, not the server's row id")
         XCTAssertEqual(workLogs.first?.clientUuid, workLogClientUuid)
+    }
+}
+
+// MARK: - SyncEngine.syncSurfaces clientUuid dedup (M5b)
+
+/// `SyncEngine.syncSurfaces`'s clientUuid-based dedup (M5b) — same pattern/reasoning as
+/// `SyncEngineWorkLogDedupTests`, reusing `SyncEngineTests.swift`'s `StubSyncBackend` (same test
+/// target, already `internal`, not re-declared).
+@MainActor
+final class SyncEngineSurfaceDedupTests: XCTestCase {
+    func freshDefaults() -> UserDefaults {
+        UserDefaults(suiteName: "SyncEngineSurfaceDedupTests.\(UUID().uuidString)")!
+    }
+
+    func makeContext() throws -> ModelContext {
+        try StoreContainer.make(inMemory: true).mainContext
+    }
+
+    func testSyncSurfacesReconcilesDeviceCapturedRowByClientUuidInsteadOfDuplicating() async throws {
+        let stub = StubSyncBackend()
+        let surfaceClientUuid = UUID().uuidString
+        // A pane this device captured + reconciled: local id == clientUuid, distinct from the
+        // server's own row id.
+        let context = try makeContext()
+        context.insert(Surface(
+            id: surfaceClientUuid, jobId: "job-1", label: "Front Door Glass", status: "MEASURED",
+            clientUuid: surfaceClientUuid, serverId: "server-real-surf-1", updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        try context.save()
+
+        // The server's own projection of that same pane: a DIFFERENT id, the same clientUuid.
+        stub.surfacesResult = .success([
+            SurfaceRecord(jobId: "job-1", surface: SurfaceDTO(
+                id: "server-real-surf-1", label: "Front Door Glass", status: "CUT", notes: nil,
+                buildingId: "bldg-1", elevationId: "elev-1", roomId: nil,
+                updatedAt: Date(timeIntervalSince1970: 2_000), clientUuid: surfaceClientUuid
+            ))
+        ])
+        let engine = SyncEngine(backend: stub, modelContext: context, watermarks: SyncWatermarks(defaults: freshDefaults()))
+
+        await engine.syncAll()
+
+        let surfaces = try context.fetch(FetchDescriptor<Surface>())
+        XCTAssertEqual(surfaces.count, 1, "must reconcile the existing clientUuid row, never insert a duplicate")
+        let surface = try XCTUnwrap(surfaces.first)
+        XCTAssertEqual(surface.id, surfaceClientUuid, "id is never remapped to the server's own row id")
+        XCTAssertEqual(surface.status, "CUT", "the newer server status is applied in place")
+        XCTAssertEqual(surface.buildingId, "bldg-1")
+    }
+
+    func testSyncSurfacesFallsBackToIdMatchWhenDtoHasNoClientUuid() async throws {
+        // An estimator-created pane never went through a device capture, so its wire clientUuid
+        // is nil — must still dedup, by id, exactly like before M5b.
+        let stub = StubSyncBackend()
+        let context = try makeContext()
+        context.insert(Surface(
+            id: "estimator-surf-1", jobId: "job-1", label: "Window", status: "MEASURED",
+            updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        try context.save()
+
+        stub.surfacesResult = .success([
+            SurfaceRecord(jobId: "job-1", surface: SurfaceDTO(
+                id: "estimator-surf-1", label: "Window", status: "FILM_CUT", notes: nil,
+                buildingId: nil, elevationId: nil, roomId: nil,
+                updatedAt: Date(timeIntervalSince1970: 2_000), clientUuid: nil
+            ))
+        ])
+        let engine = SyncEngine(backend: stub, modelContext: context, watermarks: SyncWatermarks(defaults: freshDefaults()))
+
+        await engine.syncAll()
+
+        let surfaces = try context.fetch(FetchDescriptor<Surface>())
+        XCTAssertEqual(surfaces.count, 1)
+        XCTAssertEqual(surfaces.first?.id, "estimator-surf-1")
+        XCTAssertEqual(surfaces.first?.status, "FILM_CUT")
+    }
+
+    func testSyncSurfacesInsertsFreshRowKeyedByClientUuidNotServerRowId() async throws {
+        // A device-captured pane this device has never seen (another tech's device) — a fresh
+        // insert must key by clientUuid so a later resync matches it instead of duplicating.
+        let stub = StubSyncBackend()
+        let context = try makeContext()
+        let surfaceClientUuid = UUID().uuidString
+        stub.surfacesResult = .success([
+            SurfaceRecord(jobId: "job-1", surface: SurfaceDTO(
+                id: "server-real-surf-9", label: "Pane", status: "MEASURED", notes: nil,
+                buildingId: nil, elevationId: nil, roomId: nil,
+                updatedAt: Date(timeIntervalSince1970: 1_000), clientUuid: surfaceClientUuid
+            ))
+        ])
+        let engine = SyncEngine(backend: stub, modelContext: context, watermarks: SyncWatermarks(defaults: freshDefaults()))
+
+        await engine.syncAll()
+
+        let surfaces = try context.fetch(FetchDescriptor<Surface>())
+        XCTAssertEqual(surfaces.count, 1)
+        XCTAssertEqual(surfaces.first?.id, surfaceClientUuid, "fresh insert keys by clientUuid, not the server's row id")
+        XCTAssertEqual(surfaces.first?.clientUuid, surfaceClientUuid)
     }
 }

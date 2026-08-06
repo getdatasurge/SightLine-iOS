@@ -59,6 +59,17 @@ final class Elevation {
     /// one. Identity/dedup logic (`SyncEngine.syncBuildings`, `OutboxWorker.reconcileElevation`)
     /// therefore always matches on `id`, never this field — see both doc comments.
     var clientUuid: String?
+    /// The server's real primary key for this elevation (M5b chain resolver). Populated on
+    /// EVERY path that ever learns it — `OutboxWorker.reconcileElevation` after a successful
+    /// `.elevationCreate` replay, and `SyncEngine.syncBuildings`'s upsert (both insert and
+    /// update branches) — regardless of whether the row also carries a `clientUuid`. For an
+    /// estimator-created elevation (`clientUuid == nil`) this is trivially `serverId == id`
+    /// (both are `dto.id`); for a field-added one it's `nil` only during the brief window
+    /// between `ElevationActions.addElevation` minting the row (`id == clientUuid`, no server
+    /// id yet) and that row's own `.elevationCreate` succeeding. The single source of truth for
+    /// the wire `elevationId` a `.surfaceCapture` dispatch resolves to — see
+    /// `OutboxWorker.resolveServerId`.
+    var serverId: String?
     var updatedAt: Date
 
     init(
@@ -71,6 +82,7 @@ final class Elevation {
         facing: String? = nil,
         fieldAdded: Bool,
         clientUuid: String? = nil,
+        serverId: String? = nil,
         updatedAt: Date
     ) {
         self.id = id
@@ -82,6 +94,7 @@ final class Elevation {
         self.facing = facing
         self.fieldAdded = fieldAdded
         self.clientUuid = clientUuid
+        self.serverId = serverId
         self.updatedAt = updatedAt
     }
 }

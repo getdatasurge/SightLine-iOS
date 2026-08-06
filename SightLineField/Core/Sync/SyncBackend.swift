@@ -92,6 +92,16 @@ struct SurfaceDTO: Decodable, Equatable, Sendable {
     let elevationId: String?
     let roomId: String?
     let updatedAt: Date
+    /// The pane's client-minted idempotency key (M5b device capture), echoed back on the
+    /// `GET /jobs/{id}/surfaces` projection once the backend's `clientUuid`-widening lands
+    /// (`.superpowers/sdd/m5b-surfaces-proj-report.md`, already shipped) — `nil` for an
+    /// estimator-created pane that never went through a device capture. `var` + a default,
+    /// exactly like `WorkLogDTO`/`ElevationDTO`'s `clientUuid` (a `let` with a default is
+    /// silently excluded from `Decodable` synthesis): keeps every existing `SurfaceDTO(...)`
+    /// call site (`SurveySyncTests.swift`, outside this task's scope) compiling unchanged.
+    /// Decode is generic (`additionalProperties` JSON round-trip), so this needs no regenerated
+    /// client — the field is read straight off the wire object whenever present.
+    var clientUuid: String? = nil
 }
 
 /// A `SurfaceDTO` paired with the id of the job it was fetched under — see `SurfaceDTO`'s doc

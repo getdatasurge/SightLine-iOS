@@ -110,6 +110,31 @@ final class Surface {
     var buildingId: String?
     var elevationId: String?
     var roomId: String?
+    /// M5b device capture (optimistic pane measurement). All `nil` for a pre-M5b synced row;
+    /// filled in by `OutboxWorker.reconcileSurface` from the `POST /jobs/{id}/surfaces`
+    /// response. `areaSqFt` stays `nil` until then — server-computed and eighth-inch-fraction
+    /// aware, deliberately not duplicated client-side (same "derived field stays nil until
+    /// reconcile" stance the capture flow documents). `widthFraction`/`heightFraction` are
+    /// WinTracker eighth-inch labels ("none"/"1/8"/…).
+    var widthIn: Double?
+    var heightIn: Double?
+    var widthFraction: String?
+    var heightFraction: String?
+    var quantity: Int?
+    var glassType: String?
+    var areaSqFt: Double?
+    /// The field-captured identity key (M5b), mirroring `Elevation.clientUuid`: minted by
+    /// `SurfaceActions.captureSurface` for an offline capture, doubling as this row's own `id`
+    /// forever from that instant. `nil` for a pre-existing estimator-synced pane. Optional for
+    /// the same lightweight-migration reason `Elevation.clientUuid` is (rows predate the
+    /// column).
+    var clientUuid: String?
+    /// The server's real primary key for this pane (M5b chain resolver) — the wire `entityId` a
+    /// `.photoUpload(entityType: "surface")` dispatch resolves to. Populated by
+    /// `reconcileSurface` after a `.surfaceCapture` replay succeeds; `nil` until then for a
+    /// field-captured pane (and, this slice, for an estimator-synced pane — `syncSurfaces`
+    /// doesn't yet widen to set it, see that method). See `OutboxWorker.resolveServerId`.
+    var serverId: String?
     var updatedAt: Date
 
     init(
@@ -120,6 +145,15 @@ final class Surface {
         buildingId: String? = nil,
         elevationId: String? = nil,
         roomId: String? = nil,
+        widthIn: Double? = nil,
+        heightIn: Double? = nil,
+        widthFraction: String? = nil,
+        heightFraction: String? = nil,
+        quantity: Int? = nil,
+        glassType: String? = nil,
+        areaSqFt: Double? = nil,
+        clientUuid: String? = nil,
+        serverId: String? = nil,
         updatedAt: Date
     ) {
         self.id = id
@@ -129,6 +163,15 @@ final class Surface {
         self.buildingId = buildingId
         self.elevationId = elevationId
         self.roomId = roomId
+        self.widthIn = widthIn
+        self.heightIn = heightIn
+        self.widthFraction = widthFraction
+        self.heightFraction = heightFraction
+        self.quantity = quantity
+        self.glassType = glassType
+        self.areaSqFt = areaSqFt
+        self.clientUuid = clientUuid
+        self.serverId = serverId
         self.updatedAt = updatedAt
     }
 }

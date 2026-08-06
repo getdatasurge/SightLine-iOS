@@ -273,42 +273,55 @@ final class SyncEngine {
 
     /// `SurfaceDTO.notes` isn't persisted (no such column on `Surface` yet). `SurfaceRecord
     /// .jobId` — injected by `LiveSyncBackend` since the wire item itself carries none — is
-    /// what actually links the row to its job locally.
+    /// what actually links the row to its job locally. Dedup is keyed by `dto.surface.clientUuid
+    /// ?? dto.surface.id` matched against `Surface.id` (mirrors `syncWorkLogs`/`syncBuildings`'s
+    /// elevation dedup): a device-captured pane's local `id == clientUuid` (pinned by
+    /// `SurfaceActions.captureSurface`/`OutboxWorker.reconcileSurface`), so the backend echoing
+    /// that same `clientUuid` back (M5b GET-projection widening, already shipped) updates the
+    /// optimistic row in place instead of inserting a duplicate.
     private func syncSurfaces() async throws {
         let watermark = watermarks.get(.surfaces)
         let dtos = try await backend.fetchSurfaces(since: SyncPlanner.decide(watermark: watermark).since)
         guard !dtos.isEmpty else { return }
 
-        let ids = Set(dtos.map { $0.surface.id })
-        let existing = try modelContext.fetch(FetchDescriptor<Surface>(predicate: #Predicate { ids.contains($0.id) }))
-        let existingById = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
+        let keys = Set(dtos.map { $0.surface.clientUuid ?? $0.surface.id })
+        let existing = try modelContext.fetch(FetchDescriptor<Surface>(predicate: #Predicate { keys.contains($0.id) }))
+        let existingByKey = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
         // See `syncJobs`'s `dtoById` comment: mirrors `planUpserts`'s newest-wins tie-break.
-        let dtoById = Dictionary(dtos.map { ($0.surface.id, $0) }, uniquingKeysWith: { current, new in current.surface.updatedAt >= new.surface.updatedAt ? current : new })
+        let dtoByKey = Dictionary(
+            dtos.map { ($0.surface.clientUuid ?? $0.surface.id, $0) },
+            uniquingKeysWith: { current, new in current.surface.updatedAt >= new.surface.updatedAt ? current : new }
+        )
 
         let plans = SyncPlanner.planUpserts(
-            incoming: dtos.map { SyncRecord(id: $0.surface.id, updatedAt: $0.surface.updatedAt) },
-            existingIds: Set(existingById.keys)
+            incoming: dtos.map { SyncRecord(id: $0.surface.clientUuid ?? $0.surface.id, updatedAt: $0.surface.updatedAt) },
+            existingIds: Set(existingByKey.keys)
         )
         for plan in plans {
-            guard let dto = dtoById[plan.record.id] else { continue }
-            if let model = existingById[plan.record.id] {
+            guard let dto = dtoByKey[plan.record.id] else { continue }
+            if let model = existingByKey[plan.record.id] {
+                // `id` left untouched (see the method doc). `serverId` is deliberately NOT set
+                // here — this slice populates it only via `reconcileSurface`; a `syncSurfaces`
+                // widening to also stamp it is a documented future follow-up (`Surface.serverId`).
                 model.jobId = dto.jobId
                 model.label = dto.surface.label
                 model.status = dto.surface.status
                 model.buildingId = dto.surface.buildingId
                 model.elevationId = dto.surface.elevationId
                 model.roomId = dto.surface.roomId
+                model.clientUuid = dto.surface.clientUuid
                 model.updatedAt = dto.surface.updatedAt
             } else {
                 modelContext.insert(
                     Surface(
-                        id: dto.surface.id,
+                        id: dto.surface.clientUuid ?? dto.surface.id,
                         jobId: dto.jobId,
                         label: dto.surface.label,
                         status: dto.surface.status,
                         buildingId: dto.surface.buildingId,
                         elevationId: dto.surface.elevationId,
                         roomId: dto.surface.roomId,
+                        clientUuid: dto.surface.clientUuid,
                         updatedAt: dto.surface.updatedAt
                     )
                 )
@@ -407,6 +420,11 @@ final class SyncEngine {
                 model.facing = dto.facing
                 model.fieldAdded = dto.fieldAdded
                 model.clientUuid = dto.clientUuid
+                // M5b: every path that learns the server's real elevation id persists it —
+                // the source of truth a `.surfaceCapture` dispatch resolves `elevationId`
+                // against (`OutboxWorker.resolveServerId`). Uniform for estimator-created
+                // (`serverId == id`) and field-added (`serverId != id`) rows alike.
+                model.serverId = dto.id
                 model.updatedAt = dto.updatedAt
             } else {
                 modelContext.insert(
@@ -420,6 +438,7 @@ final class SyncEngine {
                         facing: dto.facing,
                         fieldAdded: dto.fieldAdded,
                         clientUuid: dto.clientUuid,
+                        serverId: dto.id,
                         updatedAt: dto.updatedAt
                     )
                 )

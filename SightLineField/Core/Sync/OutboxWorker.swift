@@ -59,6 +59,27 @@ struct SurfaceAssignPayload: Codable, Sendable, Equatable {
     let elevationId: String
 }
 
+/// Wire body for a queued `POST /jobs/{id}/surfaces` replay (M5b) — mirrors
+/// `SurfaceActions.captureSurface`'s own parameters 1:1, `clientUuid` included (the live call
+/// needs it as an argument). `buildingId`/`elevationId` store the **local** ids exactly as the
+/// capture was made (an `Elevation.id`, possibly still a `clientUuid`); they are NEVER rewritten
+/// once queued — `OutboxWorker.attempt()` resolves `elevationId` through `Elevation.serverId`
+/// fresh at every dispatch (the chain resolver, see `resolveServerId`), keeping every payload
+/// write-once/replay-verbatim like the rest of this file.
+struct SurfaceCapturePayload: Codable, Sendable, Equatable {
+    let jobId: String
+    let label: String
+    let widthIn: Double
+    let heightIn: Double
+    let widthFraction: String?
+    let heightFraction: String?
+    let quantity: Int?
+    let glassType: String?
+    let buildingId: String?
+    let elevationId: String?
+    let clientUuid: String
+}
+
 /// The operations a `SyncOutbox` row can target. Raw values are what `WorkLogActions`/
 /// `PhotoActions`/`ElevationActions` store verbatim in `SyncOutbox.endpoint`; `OutboxWorker
 /// .drain()` dispatches on them to pick both the payload type to decode and where to replay:
@@ -79,6 +100,11 @@ enum OutboxEndpoint: String, Sendable {
     /// `POST /surfaces/{id}/assign` (M5a, pane→elevation placement). No idempotency key needed
     /// — see `SurveyWriteGateway.assignSurface`'s doc comment.
     case surfaceAssign = "surfaces/assign"
+    /// `POST /jobs/{id}/surfaces` (M5b, offline pane capture). `clientUuid`-keyed — idempotent
+    /// on replay, same shape as check-in/`.elevationCreate`. Replayed through
+    /// `OutboxWorker.surfaceCaptureGateway`; its `elevationId` is resolved from a local id to a
+    /// server id at dispatch time (the chain resolver), never at enqueue.
+    case surfaceCapture = "jobs/surfaces"
 }
 
 // MARK: - OutboxWorker
@@ -184,6 +210,14 @@ final class OutboxWorker {
     /// root sets it post-construction; `attempt()` treats an `.elevationCreate`/`.surfaceAssign`
     /// row with no gateway wired as a transient, non-pass-stopping failure rather than crashing.
     var surveyGateway: SurveyWriteGateway?
+
+    /// Additive dependency for M5b (pane capture) — same reasoning as `photoGateway`/
+    /// `surveyGateway` above: not an `init` parameter, so `WorkLogActions`'s existing
+    /// `OutboxWorker(gateway:modelContext:)` call site (and every existing test) keeps compiling
+    /// unchanged. `nil` until the composition root sets it post-construction; `attempt()` treats
+    /// a `.surfaceCapture` row with no gateway wired as a transient, non-pass-stopping failure
+    /// rather than crashing.
+    var surfaceCaptureGateway: SurfaceCaptureGateway?
 
     init(gateway: WorkLogGateway, modelContext: ModelContext) {
         self.gateway = gateway
@@ -357,9 +391,27 @@ final class OutboxWorker {
             guard let photoGateway else {
                 return .transientFailure("photo upload gateway not configured", stopsPass: false)
             }
+            // A `"surface"` holder (M5b) is resolved through `Surface.serverId` exactly like a
+            // `.surfaceCapture`'s elevation link: a pane photographed the same offline session it
+            // was captured in has a local `Surface.id == clientUuid` whose real server id lands
+            // only once its own `.surfaceCapture` succeeds — defer until then. A `"job"` holder
+            // (M4b) has no offline-create, so its `entityId` is always already a real id.
+            let resolvedEntityId: String
+            if payload.entityType == "surface" {
+                let localSurfaceId = payload.entityId
+                let surface = (try? modelContext.fetch(FetchDescriptor<Surface>(
+                    predicate: #Predicate<Surface> { $0.id == localSurfaceId }
+                )))?.first
+                switch resolveServerId(from: surface, entity: "surface") {
+                case .resolved(let serverId): resolvedEntityId = serverId
+                case .deferred(let reason): return .transientFailure(reason, stopsPass: false)
+                }
+            } else {
+                resolvedEntityId = payload.entityId
+            }
             do {
                 try await photoGateway.upload(
-                    entityType: payload.entityType, entityId: payload.entityId,
+                    entityType: payload.entityType, entityId: resolvedEntityId,
                     imageData: payload.imageData, filename: payload.filename, mimeType: payload.mimeType
                 )
                 return .success
@@ -395,6 +447,43 @@ final class OutboxWorker {
             } catch {
                 return classify(error)
             }
+        case .surfaceCapture:
+            guard let payload = try? JSONDecoder().decode(SurfaceCapturePayload.self, from: item.payload) else {
+                return .permanentFailure("undecodable surface-capture payload")
+            }
+            guard let surfaceCaptureGateway else {
+                return .transientFailure("surface capture gateway not configured", stopsPass: false)
+            }
+            // Resolve the elevation link at DISPATCH time, not enqueue time (plan §2). A `nil`
+            // `serverId` (elevation field-added this same session, its own `.elevationCreate`
+            // not yet landed) defers this row BEFORE any network call — one `attempts` bump, no
+            // wasted/incorrect request, self-heals next drain via FIFO once the parent lands.
+            let resolvedElevationId: String?
+            if let localElevationId = payload.elevationId {
+                let elevation = (try? modelContext.fetch(FetchDescriptor<Elevation>(
+                    predicate: #Predicate<Elevation> { $0.id == localElevationId }
+                )))?.first
+                switch resolveServerId(from: elevation, entity: "elevation") {
+                case .resolved(let serverId): resolvedElevationId = serverId
+                case .deferred(let reason): return .transientFailure(reason, stopsPass: false)
+                }
+            } else {
+                resolvedElevationId = nil
+            }
+            // `buildingId` needs no resolution: M5b has no offline building creation, so a
+            // present `payload.buildingId` is always already a real server id.
+            do {
+                let dto = try await surfaceCaptureGateway.captureSurface(
+                    jobId: payload.jobId, label: payload.label, widthIn: payload.widthIn, heightIn: payload.heightIn,
+                    widthFraction: payload.widthFraction, heightFraction: payload.heightFraction,
+                    quantity: payload.quantity, glassType: payload.glassType,
+                    buildingId: payload.buildingId, elevationId: resolvedElevationId, clientUuid: payload.clientUuid
+                )
+                reconcileSurface(dto, clientUuid: payload.clientUuid, jobId: payload.jobId)
+                return .success
+            } catch {
+                return classify(error)
+            }
         }
     }
 
@@ -409,7 +498,7 @@ final class OutboxWorker {
             return (try? JSONDecoder().decode(CheckInPayload.self, from: item.payload))?.clientUuid
         case .checkOut:
             return (try? JSONDecoder().decode(CheckOutPayload.self, from: item.payload))?.workLogClientUuid
-        case .photoUpload, .elevationCreate, .surfaceAssign:
+        case .photoUpload, .elevationCreate, .surfaceAssign, .surfaceCapture:
             return nil
         }
     }
@@ -519,8 +608,10 @@ final class OutboxWorker {
     /// `clientUuid` match would — without an equality comparison against `Elevation.clientUuid`,
     /// which is `nil` for most rows (`SurveyModels.swift`'s doc comment explains why that column
     /// stays optional). `id` is never reassigned here, in either branch — no remapping to the
-    /// server's own `dto.id`, which is echoed back but otherwise unused, exactly like `WorkLog`'s
-    /// `reconcile`. A `SyncEngine.syncBuildings` pass that later re-fetches this same elevation
+    /// server's own `dto.id`. That `dto.id` IS now persisted, though, as `serverId` (M5b chain
+    /// resolver — the source of truth for the wire `elevationId` a `.surfaceCapture` dispatch
+    /// resolves against, set in both branches). A `SyncEngine.syncBuildings` pass that later
+    /// re-fetches this same elevation
     /// (now with the identical `clientUuid` echoed back on the wire) upserts by that same key
     /// (`dto.clientUuid ?? dto.id`) against the same `id` — see that method's own doc comment —
     /// so a create followed by a sync never produces two local rows for what the server
@@ -537,6 +628,7 @@ final class OutboxWorker {
             model.facing = dto.facing
             model.fieldAdded = dto.fieldAdded
             model.clientUuid = dto.clientUuid
+            model.serverId = dto.id
             model.updatedAt = dto.updatedAt
         } else {
             modelContext.insert(Elevation(
@@ -549,6 +641,89 @@ final class OutboxWorker {
                 facing: dto.facing,
                 fieldAdded: dto.fieldAdded,
                 clientUuid: dto.clientUuid,
+                serverId: dto.id,
+                updatedAt: dto.updatedAt
+            ))
+        }
+        // Covered by the same `save()` the caller (`runPass`) makes right after this row's own
+        // outcome — one write for both, not two.
+    }
+
+    // MARK: - Chain resolver (M5b)
+
+    private enum ServerIdResolution {
+        case resolved(String)
+        case deferred(String)
+    }
+
+    /// The shared 3-way resolution the M5b chain resolver applies to an ALREADY-fetched local
+    /// row (an `Elevation` for `.surfaceCapture`'s elevation link, a `Surface` for
+    /// `.photoUpload`'s surface holder): `.resolved` only when the row exists AND has learned
+    /// its `serverId`; otherwise `.deferred`, so the caller returns a non-pass-stopping
+    /// transient failure BEFORE any network call — no wasted/incorrect request, self-healing on
+    /// the next drain once the parent's own create lands (FIFO guarantees that create is
+    /// processed earlier in the same pass; see plan §2). The lookup itself stays at each call
+    /// site with a CONCRETE `FetchDescriptor`/`#Predicate` — a generic `#Predicate<T>` over a
+    /// protocol requirement resolves `$0.id` to a computed keypath SwiftData can't map to a
+    /// stored column (runtime trap), so only the type-agnostic decision is shared here.
+    private func resolveServerId<T: ServerLinked>(from model: T?, entity: String) -> ServerIdResolution {
+        guard let model else {
+            return .deferred("referenced \(entity) not found locally")
+        }
+        guard let serverId = model.serverId else {
+            return .deferred("referenced \(entity) not yet synced")
+        }
+        return .resolved(serverId)
+    }
+
+    // MARK: - Reconcile (Surface)
+
+    /// Upserts the server's authoritative pane row after a successful `.surfaceCapture` replay
+    /// — mirrors `reconcileElevation`'s WorkLog/Elevation precedent: matched by `Surface.id ==
+    /// clientUuid` (`SurfaceActions.captureSurface` pins `id == clientUuid` from the moment it
+    /// mints the row), `id` never remapped to the server's own `dto.id` in either branch. The
+    /// load-bearing write is `model.serverId = dto.id` — the value a later `.photoUpload`
+    /// surface holder resolves against — plus the server-computed `areaSqFt`/`status`. `jobId`
+    /// is threaded from the payload for the fallback-insert path only (the capture projection
+    /// carries none, being path-scoped); the update path leaves the row's existing `jobId`
+    /// untouched (already correct from the optimistic capture).
+    private func reconcileSurface(_ dto: SurfaceCaptureDTO, clientUuid: String, jobId: String) {
+        if let model = try? modelContext.fetch(FetchDescriptor<Surface>(
+            predicate: #Predicate<Surface> { $0.id == clientUuid }
+        )).first {
+            model.label = dto.label
+            model.status = dto.status
+            model.widthIn = dto.widthIn
+            model.heightIn = dto.heightIn
+            model.widthFraction = dto.widthFraction
+            model.heightFraction = dto.heightFraction
+            model.quantity = dto.quantity
+            model.glassType = dto.glassType
+            model.areaSqFt = dto.areaSqFt
+            model.buildingId = dto.buildingId
+            model.elevationId = dto.elevationId
+            model.roomId = dto.roomId
+            model.clientUuid = dto.clientUuid ?? clientUuid
+            model.serverId = dto.id
+            model.updatedAt = dto.updatedAt
+        } else {
+            modelContext.insert(Surface(
+                id: clientUuid,
+                jobId: jobId,
+                label: dto.label,
+                status: dto.status,
+                buildingId: dto.buildingId,
+                elevationId: dto.elevationId,
+                roomId: dto.roomId,
+                widthIn: dto.widthIn,
+                heightIn: dto.heightIn,
+                widthFraction: dto.widthFraction,
+                heightFraction: dto.heightFraction,
+                quantity: dto.quantity,
+                glassType: dto.glassType,
+                areaSqFt: dto.areaSqFt,
+                clientUuid: dto.clientUuid ?? clientUuid,
+                serverId: dto.id,
                 updatedAt: dto.updatedAt
             ))
         }
@@ -556,3 +731,16 @@ final class OutboxWorker {
         // outcome — one write for both, not two.
     }
 }
+
+/// The shared shape the M5b chain resolver (`OutboxWorker.resolveServerId`) reads: a local row
+/// whose `serverId` is the real server primary key once learned (`nil` until then for a
+/// field-created row). `Elevation` (a `.surfaceCapture`'s elevation link) and `Surface` (a
+/// `.photoUpload` surface holder) both satisfy it — one resolver decision for both. Not
+/// `PersistentModel`-constrained and holds no `id` requirement: the per-type `FetchDescriptor`
+/// lookup stays concrete at each call site (see `resolveServerId`), so this only needs to
+/// expose `serverId`.
+private protocol ServerLinked {
+    var serverId: String? { get }
+}
+extension Elevation: ServerLinked {}
+extension Surface: ServerLinked {}

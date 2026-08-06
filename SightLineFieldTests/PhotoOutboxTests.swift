@@ -97,6 +97,13 @@ final class PhotoOutboxTests: XCTestCase {
     func testDrainWithSuccessStubPurgesRowAndCallsUploadWithDecodedFields() async throws {
         let context = try makeContext()
         let imageData = Data([0x01, 0x02, 0x03])
+        // M5b: a "surface" photo now resolves its entityId through a local Surface's serverId,
+        // so the pane must already be synced (serverId set). id == serverId here so the resolved
+        // upload id stays "surface-9", keeping this happy-path's field-decoding assertions intact.
+        context.insert(Surface(
+            id: "surface-9", jobId: "job-1", label: "Pane", status: "MEASURED",
+            clientUuid: "surface-9", serverId: "surface-9", updatedAt: Date(timeIntervalSince1970: 400)
+        ))
         insertPhotoItem(
             context: context, entityType: "surface", entityId: "surface-9",
             filename: "abc.jpg", mimeType: "image/jpeg", imageData: imageData,
@@ -214,5 +221,66 @@ final class PhotoOutboxTests: XCTestCase {
             predicate: #Predicate<SyncOutbox> { $0.endpoint == checkInEndpoint }
         ))
         XCTAssertTrue(remainingCheckIns.isEmpty, "the check-in row succeeded and is purged (OutboxWorker Minor #4), never left `.done`")
+    }
+
+    // MARK: - OutboxWorker.drain(): .photoUpload surface holder chain resolution (M5b)
+
+    /// A `"surface"` upload resolves its `entityId` through `Surface.serverId` exactly like a
+    /// `.surfaceCapture`'s elevation link: a pane photographed the same offline session it was
+    /// captured in has a local `Surface.id == clientUuid` whose real server id lands only once
+    /// its own `.surfaceCapture` succeeds. Until then the upload defers (gateway never called);
+    /// once `serverId` is set it dispatches with the resolved id.
+    func testDrainSurfacePhotoDefersUntilSurfaceServerIdKnownThenUploadsResolvedId() async throws {
+        let context = try makeContext()
+        let surfaceClientUuid = UUID().uuidString
+        context.insert(Surface(
+            id: surfaceClientUuid, jobId: "job-1", label: "Pane", status: "MEASURED",
+            clientUuid: surfaceClientUuid, serverId: nil, updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        let item = insertPhotoItem(context: context, entityType: "surface", entityId: surfaceClientUuid, createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let photoGateway = FakePhotoUploadGateway()
+        photoGateway.uploadResult = .success(())
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.photoGateway = photoGateway
+
+        // Surface not yet synced (serverId nil) → defer before any upload.
+        await worker.drain()
+
+        XCTAssertTrue(photoGateway.uploadCalls.isEmpty, "the surface holder is unresolved — never upload against a not-yet-synced pane")
+        XCTAssertEqual(item.state, OutboxState.pending.rawValue)
+        XCTAssertEqual(item.attempts, 1)
+
+        // The pane's own .surfaceCapture lands (simulate reconcileSurface setting serverId).
+        let surface = try XCTUnwrap(try context.fetch(FetchDescriptor<Surface>()).first)
+        surface.serverId = "srv-surf-1"
+        try context.save()
+
+        await worker.drain()
+
+        XCTAssertEqual(photoGateway.uploadCalls.count, 1)
+        XCTAssertEqual(photoGateway.uploadCalls.first?.entityType, "surface")
+        XCTAssertEqual(photoGateway.uploadCalls.first?.entityId, "srv-surf-1", "uploads against the RESOLVED server surface id, never the local clientUuid")
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "row purged after success")
+    }
+
+    /// A `"job"` upload (M4b) has no offline-create — its `entityId` passes through unchanged,
+    /// never routed through the surface resolver (a `Surface` lookup on a job id would spuriously
+    /// defer forever). Locks in that the M5b resolver only touches `"surface"` holders.
+    func testDrainJobPhotoUploadsEntityIdUnchangedWithoutResolution() async throws {
+        let context = try makeContext()
+        insertPhotoItem(context: context, entityType: "job", entityId: "job-42", createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let photoGateway = FakePhotoUploadGateway()
+        photoGateway.uploadResult = .success(())
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.photoGateway = photoGateway
+
+        await worker.drain()
+
+        XCTAssertEqual(photoGateway.uploadCalls.count, 1)
+        XCTAssertEqual(photoGateway.uploadCalls.first?.entityId, "job-42", "a job holder's entityId is passed through unresolved")
     }
 }
