@@ -74,7 +74,7 @@ final class PhotoOutboxTests: XCTestCase {
         XCTAssertEqual(payload.imageData, imageData)
         XCTAssertEqual(payload.mimeType, "image/jpeg")
 
-        await waitUntil { photoGateway.uploadCalls.count == 1 }
+        await waitUntil { photoGateway.uploadCalls.count == 1 && ((try? context.fetch(FetchDescriptor<SyncOutbox>()))?.isEmpty ?? false) }
         XCTAssertEqual(photoGateway.uploadCalls.count, 1, "enqueuePhoto must trigger its own drain, offline-first, without the caller draining itself")
         XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "a successfully-synced row is purged (OutboxWorker Minor #4), never left `.done`")
     }

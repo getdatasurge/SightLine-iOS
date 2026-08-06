@@ -58,9 +58,14 @@ final class OfflineElevationUITests: XCTestCase {
 
             // First job → detail → "Elevations" nav entry (JobDetailView's Surfaces section,
             // per commit 2ff9e22) → JobElevationsView.
-            let firstJob = app.cells.firstMatch
-            XCTAssertTrue(firstJob.waitForExistence(timeout: 15), "Job list did not populate")
-            firstJob.tap()
+            // All seed jobs share one `updatedAt`, so `@Query(sort: updatedAt desc)` ties and
+            // `cells.firstMatch` is nondeterministic — three seed jobs have no buildings. Target
+            // the commercial job (seed-demo-job-02, "Office glass…", 4 buildings / 8 elevations)
+            // deterministically by its list title so this smoke always lands on synced buildings.
+            XCTAssertTrue(app.cells.firstMatch.waitForExistence(timeout: 15), "Job list did not populate")
+            let seedJob = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Office glass")).firstMatch
+            XCTAssertTrue(seedJob.waitForExistence(timeout: 15), "Seed job with buildings ('Office glass') did not appear")
+            seedJob.tap()
 
             let elevationsEntry = app.buttons["Elevations"]
             XCTAssertTrue(elevationsEntry.waitForExistence(timeout: 15), "Elevations nav entry did not appear on job detail")
