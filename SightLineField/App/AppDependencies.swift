@@ -52,7 +52,7 @@ final class AppDependencies {
 
         let container: ModelContainer
         do {
-            container = try StoreContainer.make(inMemory: inMemoryStore)
+            container = try StoreContainer.make(inMemory: inMemoryStore || uitestReset)
         } catch {
             // A local SwiftData store failing to open (disk full, corrupt file, migration
             // failure) leaves the app with no usable data layer — nothing downstream can
@@ -62,6 +62,10 @@ final class AppDependencies {
         self.modelContainer = container
 
         let watermarks = SyncWatermarks(defaults: .standard)
+        // UITest isolation: a `-uitest-reset` launch runs on a fresh in-memory store (above), so
+        // drop the delta watermarks too — otherwise a stale watermark makes the first sync a
+        // no-op delta against an empty store and no jobs would ever appear.
+        if uitestReset { watermarks.clearAll() }
         self.syncEngine = SyncEngine(
             backend: LiveSyncBackend(client: client),
             modelContext: container.mainContext,

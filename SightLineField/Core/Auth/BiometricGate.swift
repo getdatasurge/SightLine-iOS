@@ -34,29 +34,38 @@ struct LABiometricEvaluator: BiometricEvaluator {
 @MainActor
 @Observable
 final class BiometricGate {
-    private(set) var isUnlocked: Bool = false
+    private(set) var isUnlocked: Bool
 
     private let evaluator: BiometricEvaluator
     private let enabled: Bool
 
-    /// - Parameter enabled: `false` disables the gate entirely (`requireUnlock()` unlocks
-    ///   immediately without touching the evaluator) — set by UITest/`-uitest-reset` launches
-    ///   so automated flows never block on a biometric prompt.
+    /// True only when a real biometric prompt can actually run. Gated off (`-uitest-reset`) or
+    /// no enrolled biometric (simulator / non-biometric device) means there is nothing to
+    /// unlock, so the gate never engages and no lock overlay is ever shown.
+    private var gateApplies: Bool { enabled && evaluator.isAvailable }
+
+    /// - Parameter enabled: `false` disables the gate entirely — set by UITest/`-uitest-reset`
+    ///   launches so automated flows never block on (or flash) a biometric prompt.
     init(evaluator: BiometricEvaluator = LABiometricEvaluator(), enabled: Bool = true) {
         self.evaluator = evaluator
         self.enabled = enabled
+        // Start unlocked unless a real gate applies, so disabled and no-biometric contexts
+        // never flash a lock overlay on `.signedIn`.
+        self.isUnlocked = !(enabled && evaluator.isAvailable)
     }
 
     func requireUnlock() async {
-        guard enabled, evaluator.isAvailable else {
+        guard gateApplies else {
             isUnlocked = true
             return
         }
         isUnlocked = await evaluator.evaluate(reason: "Unlock SightLine Field")
     }
 
-    /// Called on `scenePhase`/resign-active transitions so the next foreground re-gates.
+    /// Called on `scenePhase`/resign-active transitions so the next foreground re-gates. No-op
+    /// when no gate applies, so a background→foreground cycle never flashes an overlay either.
     func lock() {
+        guard gateApplies else { return }
         isUnlocked = false
     }
 }
