@@ -160,7 +160,7 @@ struct JobDetailView: View {
     /// `PhotoActions.enqueuePhoto`'s `mimeType: "image/jpeg"` is always accurate. Falls back to
     /// the raw bytes if decoding fails (simulator-synthesized library images, or `UIKit`
     /// unavailable) rather than silently dropping the capture.
-    private static func jpegData(from data: Data) -> Data {
+    static func jpegData(from data: Data) -> Data {
         #if canImport(UIKit)
         if let image = UIImage(data: data), let jpeg = image.jpegData(compressionQuality: 0.8) {
             return jpeg
