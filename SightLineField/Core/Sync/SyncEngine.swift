@@ -373,19 +373,32 @@ final class SyncEngine {
             }
         }
 
+        // M5a write lane: keyed by `dto.clientUuid ?? dto.id` — mirrors `syncWorkLogs`'s dedup
+        // exactly (see that method's doc comment). A field-added elevation's local row (minted
+        // by `ElevationActions.addElevation`, reconciled by `OutboxWorker.reconcileElevation`)
+        // has `id == clientUuid` forever; the backend echoes `clientUuid` back on that same row
+        // once it's synced down again (`.superpowers/sdd/m5a-backend-report.md`), so matching
+        // existing rows against `Elevation.id` (never inserting/matching by bare `dto.id` when
+        // a `clientUuid` is present) finds that identical row instead of duplicating it — the
+        // create-then-sync acceptance case this dedup exists for. An estimator-created elevation
+        // (`dto.clientUuid == nil`) falls back to `dto.id`, unchanged from before this lane.
         let elevationDTOs = buildingDTOs.flatMap(\.building.elevations)
-        let elevationIds = Set(elevationDTOs.map(\.id))
-        let existingElevations = try modelContext.fetch(FetchDescriptor<Elevation>(predicate: #Predicate { elevationIds.contains($0.id) }))
-        let existingElevationsById = Dictionary(uniqueKeysWithValues: existingElevations.map { ($0.id, $0) })
-        let elevationById = Dictionary(elevationDTOs.map { ($0.id, $0) }, uniquingKeysWith: { current, new in current.updatedAt >= new.updatedAt ? current : new })
+        let elevationKeys = Set(elevationDTOs.map { $0.clientUuid ?? $0.id })
+        let existingElevations = try modelContext.fetch(FetchDescriptor<Elevation>(predicate: #Predicate { elevationKeys.contains($0.id) }))
+        let existingElevationsByKey = Dictionary(uniqueKeysWithValues: existingElevations.map { ($0.id, $0) })
+        let elevationByKey = Dictionary(
+            elevationDTOs.map { ($0.clientUuid ?? $0.id, $0) },
+            uniquingKeysWith: { current, new in current.updatedAt >= new.updatedAt ? current : new }
+        )
 
         let elevationPlans = SyncPlanner.planUpserts(
-            incoming: elevationDTOs.map { SyncRecord(id: $0.id, updatedAt: $0.updatedAt) },
-            existingIds: Set(existingElevationsById.keys)
+            incoming: elevationDTOs.map { SyncRecord(id: $0.clientUuid ?? $0.id, updatedAt: $0.updatedAt) },
+            existingIds: Set(existingElevationsByKey.keys)
         )
         for plan in elevationPlans {
-            guard let dto = elevationById[plan.record.id] else { continue }
-            if let model = existingElevationsById[plan.record.id] {
+            guard let dto = elevationByKey[plan.record.id] else { continue }
+            if let model = existingElevationsByKey[plan.record.id] {
+                // `id` is left untouched — see the comment above.
                 model.buildingId = dto.buildingId
                 model.elevationNumber = dto.elevationNumber
                 model.numberLabel = dto.numberLabel
@@ -393,11 +406,12 @@ final class SyncEngine {
                 model.bearing = dto.bearing
                 model.facing = dto.facing
                 model.fieldAdded = dto.fieldAdded
+                model.clientUuid = dto.clientUuid
                 model.updatedAt = dto.updatedAt
             } else {
                 modelContext.insert(
                     Elevation(
-                        id: dto.id,
+                        id: dto.clientUuid ?? dto.id,
                         buildingId: dto.buildingId,
                         elevationNumber: dto.elevationNumber,
                         numberLabel: dto.numberLabel,
@@ -405,6 +419,7 @@ final class SyncEngine {
                         bearing: dto.bearing,
                         facing: dto.facing,
                         fieldAdded: dto.fieldAdded,
+                        clientUuid: dto.clientUuid,
                         updatedAt: dto.updatedAt
                     )
                 )

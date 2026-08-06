@@ -46,6 +46,27 @@ final class FakeWorkLogGateway: WorkLogGateway, @unchecked Sendable {
     }
 }
 
+/// Fakes `SurveyWriteGateway` for direct `OutboxWorker.drain()` testing (M5a) — mirrors
+/// `FakeWorkLogGateway`'s shape/reasoning exactly: no `ElevationActions` involved, so there's no
+/// competing fire-and-forget drain to race against.
+final class FakeSurveyWriteGateway: SurveyWriteGateway, @unchecked Sendable {
+    var createElevationResult: Result<ElevationDTO, Error> = .failure(ApiError.decoding)
+    var assignSurfaceResult: Result<Void, Error> = .success(())
+
+    private(set) var createElevationCalls: [(buildingId: String, label: String, facing: String?, clientUuid: String)] = []
+    private(set) var assignSurfaceCalls: [(surfaceId: String, buildingId: String, elevationId: String)] = []
+
+    func createElevation(buildingId: String, label: String, facing: String?, clientUuid: String) async throws -> ElevationDTO {
+        createElevationCalls.append((buildingId, label, facing, clientUuid))
+        return try createElevationResult.get()
+    }
+
+    func assignSurface(surfaceId: String, buildingId: String, elevationId: String) async throws {
+        assignSurfaceCalls.append((surfaceId, buildingId, elevationId))
+        _ = try assignSurfaceResult.get()
+    }
+}
+
 @MainActor
 final class OutboxWorkerTests: XCTestCase {
     func makeContext() throws -> ModelContext {
@@ -637,6 +658,256 @@ final class OutboxWorkerTests: XCTestCase {
         worker.refreshCounts()
 
         await fulfillment(of: [changed], timeout: 1.0)
+    }
+
+    // MARK: - drain(): .elevationCreate (M5a)
+
+    private func elevationDto(
+        id: String,
+        buildingId: String = "bldg-1",
+        elevationNumber: Int = 1,
+        numberLabel: String? = nil,
+        label: String = "North Wall",
+        bearing: Int? = nil,
+        facing: String? = nil,
+        fieldAdded: Bool = true,
+        updatedAt: Date = Date(timeIntervalSince1970: 1_000),
+        clientUuid: String? = nil
+    ) -> ElevationDTO {
+        ElevationDTO(
+            id: id, buildingId: buildingId, elevationNumber: elevationNumber, numberLabel: numberLabel,
+            label: label, bearing: bearing, facing: facing, fieldAdded: fieldAdded, updatedAt: updatedAt, clientUuid: clientUuid
+        )
+    }
+
+    @discardableResult
+    private func insertElevationCreateItem(
+        context: ModelContext, buildingId: String = "bldg-1", label: String = "North Wall", facing: String? = nil,
+        clientUuid: String, attempts: Int = 0, state: OutboxState = .pending, createdAt: Date
+    ) -> SyncOutbox {
+        let payload = ElevationCreatePayload(buildingId: buildingId, label: label, facing: facing, clientUuid: clientUuid)
+        let item = SyncOutbox(
+            clientUuid: UUID().uuidString, endpoint: OutboxEndpoint.elevationCreate.rawValue,
+            payload: try! JSONEncoder().encode(payload), attempts: attempts, state: state.rawValue, createdAt: createdAt
+        )
+        context.insert(item)
+        return item
+    }
+
+    @discardableResult
+    private func insertSurfaceAssignItem(
+        context: ModelContext, surfaceId: String, buildingId: String = "bldg-1", elevationId: String = "elev-1",
+        attempts: Int = 0, state: OutboxState = .pending, createdAt: Date
+    ) -> SyncOutbox {
+        let payload = SurfaceAssignPayload(surfaceId: surfaceId, buildingId: buildingId, elevationId: elevationId)
+        let item = SyncOutbox(
+            clientUuid: UUID().uuidString, endpoint: OutboxEndpoint.surfaceAssign.rawValue,
+            payload: try! JSONEncoder().encode(payload), attempts: attempts, state: state.rawValue, createdAt: createdAt
+        )
+        context.insert(item)
+        return item
+    }
+
+    func testDrainElevationCreateHappyPathPurgesRowAndReconcilesLocalElevation() async throws {
+        let context = try makeContext()
+        let clientUuid = UUID().uuidString
+        context.insert(Elevation(
+            id: clientUuid, buildingId: "bldg-1", elevationNumber: 99, label: "North Wall", fieldAdded: true,
+            clientUuid: clientUuid, updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        insertElevationCreateItem(context: context, clientUuid: clientUuid, createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let surveyGateway = FakeSurveyWriteGateway()
+        surveyGateway.createElevationResult = .success(elevationDto(
+            id: "server-elev-1", elevationNumber: 3, updatedAt: Date(timeIntervalSince1970: 2_000), clientUuid: clientUuid
+        ))
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surveyGateway = surveyGateway
+
+        await worker.drain()
+
+        XCTAssertEqual(surveyGateway.createElevationCalls.count, 1)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "a successfully-synced row is purged, never left `.done`")
+
+        let elevations = try context.fetch(FetchDescriptor<Elevation>())
+        XCTAssertEqual(elevations.count, 1, "reconcile must update in place, never duplicate")
+        XCTAssertEqual(elevations.first?.id, clientUuid, "id stays pinned to clientUuid, never remapped to the server's own id")
+        XCTAssertEqual(elevations.first?.elevationNumber, 3, "the server's authoritative elevationNumber replaces the local provisional one")
+        XCTAssertEqual(elevations.first?.updatedAt, Date(timeIntervalSince1970: 2_000))
+    }
+
+    func testDrainElevationCreateInsertsRowWhenNoLocalOptimisticWriteExists() async throws {
+        let context = try makeContext()
+        let clientUuid = UUID().uuidString
+        insertElevationCreateItem(context: context, clientUuid: clientUuid, createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let surveyGateway = FakeSurveyWriteGateway()
+        surveyGateway.createElevationResult = .success(elevationDto(id: "server-elev-1", clientUuid: clientUuid))
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surveyGateway = surveyGateway
+
+        await worker.drain()
+
+        let elevations = try context.fetch(FetchDescriptor<Elevation>())
+        XCTAssertEqual(elevations.count, 1)
+        XCTAssertEqual(elevations.first?.id, clientUuid)
+        XCTAssertEqual(elevations.first?.clientUuid, clientUuid)
+    }
+
+    func testDrainElevationCreateTwiceIsIdempotentNoDuplicateElevationsOrGatewayCalls() async throws {
+        let context = try makeContext()
+        let clientUuid = UUID().uuidString
+        context.insert(Elevation(
+            id: clientUuid, buildingId: "bldg-1", elevationNumber: 1, label: "North Wall", fieldAdded: true,
+            clientUuid: clientUuid, updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        insertElevationCreateItem(context: context, clientUuid: clientUuid, createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let surveyGateway = FakeSurveyWriteGateway()
+        surveyGateway.createElevationResult = .success(elevationDto(id: "server-elev-1", clientUuid: clientUuid))
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surveyGateway = surveyGateway
+
+        await worker.drain()
+        XCTAssertEqual(surveyGateway.createElevationCalls.count, 1)
+        XCTAssertEqual(try context.fetchCount(FetchDescriptor<Elevation>()), 1)
+
+        await worker.drain()
+        XCTAssertEqual(surveyGateway.createElevationCalls.count, 1, "a done row is never replayed")
+        XCTAssertEqual(try context.fetchCount(FetchDescriptor<Elevation>()), 1, "still exactly one row, no duplicate")
+    }
+
+    func testDrainElevationCreatePermanentServerRejectionBecomesConflict() async throws {
+        let context = try makeContext()
+        let item = insertElevationCreateItem(context: context, clientUuid: UUID().uuidString, createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let surveyGateway = FakeSurveyWriteGateway()
+        surveyGateway.createElevationResult = .failure(ApiError.server(status: 400))
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surveyGateway = surveyGateway
+
+        await worker.drain()
+
+        XCTAssertEqual(item.state, OutboxState.conflict.rawValue)
+        XCTAssertEqual(item.attempts, 0, "a 4xx rejection never even burns an attempt")
+    }
+
+    func testDrainElevationCreateNetworkErrorLeavesRowPendingAndStopsBeforeLaterRows() async throws {
+        let context = try makeContext()
+        let first = insertElevationCreateItem(context: context, clientUuid: UUID().uuidString, createdAt: Date(timeIntervalSince1970: 100))
+        let second = insertElevationCreateItem(context: context, clientUuid: UUID().uuidString, createdAt: Date(timeIntervalSince1970: 200))
+        try context.save()
+
+        struct Offline: Error {}
+        let surveyGateway = FakeSurveyWriteGateway()
+        surveyGateway.createElevationResult = .failure(ApiError.network(Offline()))
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surveyGateway = surveyGateway
+
+        await worker.drain()
+
+        XCTAssertEqual(surveyGateway.createElevationCalls.count, 1, "must stop after the first network failure, never touch the second row")
+        XCTAssertEqual(first.state, OutboxState.pending.rawValue)
+        XCTAssertEqual(first.attempts, 1)
+        XCTAssertEqual(second.state, OutboxState.pending.rawValue)
+        XCTAssertEqual(second.attempts, 0, "never even attempted")
+    }
+
+    func testDrainElevationCreateWithNoSurveyGatewayConfiguredStaysPendingWithoutStoppingThePass() async throws {
+        // Mirrors `.photoUpload`'s identical guard: a `.elevationCreate` row enqueued before the
+        // composition root wires `surveyGateway` (or a test/preview `OutboxWorker` that never
+        // wires one at all) must stay queued rather than crash or wrongly conflict.
+        let context = try makeContext()
+        let item = insertElevationCreateItem(context: context, clientUuid: UUID().uuidString, createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        // `surveyGateway` deliberately left nil.
+
+        await worker.drain()
+
+        XCTAssertEqual(item.state, OutboxState.pending.rawValue)
+        XCTAssertEqual(item.attempts, 1)
+    }
+
+    // MARK: - drain(): .surfaceAssign (M5a)
+
+    func testDrainSurfaceAssignHappyPathPurgesRow() async throws {
+        let context = try makeContext()
+        context.insert(Surface(id: "surf-1", jobId: "job-1", label: "Front door glass", status: "MEASURED", updatedAt: Date(timeIntervalSince1970: 1_000)))
+        insertSurfaceAssignItem(context: context, surfaceId: "surf-1", createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let surveyGateway = FakeSurveyWriteGateway()
+        surveyGateway.assignSurfaceResult = .success(())
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surveyGateway = surveyGateway
+
+        await worker.drain()
+
+        XCTAssertEqual(surveyGateway.assignSurfaceCalls.count, 1)
+        XCTAssertEqual(surveyGateway.assignSurfaceCalls.first?.surfaceId, "surf-1")
+        XCTAssertEqual(surveyGateway.assignSurfaceCalls.first?.buildingId, "bldg-1")
+        XCTAssertEqual(surveyGateway.assignSurfaceCalls.first?.elevationId, "elev-1")
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "a successfully-synced row is purged")
+    }
+
+    func testDrainSurfaceAssignIsIdempotentOnReplay() async throws {
+        let context = try makeContext()
+        insertSurfaceAssignItem(context: context, surfaceId: "surf-1", createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let surveyGateway = FakeSurveyWriteGateway()
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surveyGateway = surveyGateway
+
+        await worker.drain()
+        XCTAssertEqual(surveyGateway.assignSurfaceCalls.count, 1)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty)
+
+        await worker.drain()
+        XCTAssertEqual(surveyGateway.assignSurfaceCalls.count, 1, "a done row is never replayed")
+    }
+
+    func testDrainSurfaceAssignPermanentServerRejectionBecomesConflict() async throws {
+        let context = try makeContext()
+        let item = insertSurfaceAssignItem(context: context, surfaceId: "surf-1", createdAt: Date(timeIntervalSince1970: 500))
+        try context.save()
+
+        let surveyGateway = FakeSurveyWriteGateway()
+        surveyGateway.assignSurfaceResult = .failure(ApiError.server(status: 404))
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surveyGateway = surveyGateway
+
+        await worker.drain()
+
+        XCTAssertEqual(item.state, OutboxState.conflict.rawValue)
+        XCTAssertEqual(item.attempts, 0)
+    }
+
+    func testDrainSurfaceAssignNetworkErrorStaysPendingAndStopsPass() async throws {
+        let context = try makeContext()
+        let first = insertSurfaceAssignItem(context: context, surfaceId: "surf-1", createdAt: Date(timeIntervalSince1970: 100))
+        let second = insertSurfaceAssignItem(context: context, surfaceId: "surf-2", createdAt: Date(timeIntervalSince1970: 200))
+        try context.save()
+
+        struct Offline: Error {}
+        let surveyGateway = FakeSurveyWriteGateway()
+        surveyGateway.assignSurfaceResult = .failure(ApiError.network(Offline()))
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.surveyGateway = surveyGateway
+
+        await worker.drain()
+
+        XCTAssertEqual(surveyGateway.assignSurfaceCalls.count, 1)
+        XCTAssertEqual(first.state, OutboxState.pending.rawValue)
+        XCTAssertEqual(first.attempts, 1)
+        XCTAssertEqual(second.state, OutboxState.pending.rawValue)
+        XCTAssertEqual(second.attempts, 0)
     }
 }
 

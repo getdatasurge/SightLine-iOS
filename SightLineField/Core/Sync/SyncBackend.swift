@@ -115,6 +115,15 @@ struct ElevationDTO: Decodable, Equatable, Sendable {
     let facing: String?
     let fieldAdded: Bool
     let updatedAt: Date
+    /// The elevation's client-minted idempotency key (M5a field-add), echoed back once a row is
+    /// created via clientUuid-keyed `POST /buildings/{id}/elevations` (`m5a-backend-report.md`:
+    /// `ElevationRecord` gained `clientUuid`, same as `WorkLogRecord`); `nil` for an
+    /// estimator-created row that never went through that path. `var` + a default value, exactly
+    /// like `WorkLogDTO.clientUuid` — a `let` with a default is silently excluded from
+    /// `Decodable` synthesis (the default always wins, the wire value never read); `var` keeps
+    /// it genuinely decodable while leaving every existing `ElevationDTO(...)` call site (e.g.
+    /// `SurveySyncTests.swift`, outside this task's file scope) compiling unchanged.
+    var clientUuid: String? = nil
 }
 
 /// A job's survey building, with its elevations nested inline (`GET /jobs/{id}/buildings`

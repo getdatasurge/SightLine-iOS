@@ -186,3 +186,121 @@ final class SurveySyncTests: XCTestCase {
         XCTAssertEqual(watermarks.get(.buildings), t1)
     }
 }
+
+// MARK: - SyncEngine.syncBuildings elevation clientUuid dedup (M5a write lane)
+
+/// `SyncEngine.syncBuildings`'s clientUuid-based elevation dedup — mirrors
+/// `SyncEngineWorkLogDedupTests` (`OutboxWorkerTests.swift`) exactly, including why it lives in
+/// its own class rather than folded into `SurveySyncTests` above: keeps the M5a write lane's
+/// specific acceptance criterion ("create an elevation offline, then a buildings sync returns
+/// it — exactly ONE local row") independently readable.
+@MainActor
+final class SyncEngineElevationDedupTests: XCTestCase {
+    func freshDefaults() -> UserDefaults {
+        UserDefaults(suiteName: "SyncEngineElevationDedupTests.\(UUID().uuidString)")!
+    }
+
+    func makeContext() throws -> ModelContext {
+        try StoreContainer.make(inMemory: true).mainContext
+    }
+
+    func testSyncBuildingsReconcilesLocallyCreatedElevationByClientUuidInsteadOfDuplicating() async throws {
+        let stub = StubSyncBackend()
+        let context = try makeContext()
+        context.insert(JobSummary(id: "job-1", name: "Job job-1", status: "OPEN", updatedAt: Date(timeIntervalSince1970: 1_000)))
+
+        // A row this device created via an offline field-add and already reconciled once
+        // (`OutboxWorker.reconcileElevation`): `id` is pinned to `clientUuid`, distinct from
+        // whatever the server's own row id turns out to be.
+        let clientUuid = UUID().uuidString
+        context.insert(Elevation(
+            id: clientUuid, buildingId: "bldg-1", elevationNumber: 3, label: "New Wall", fieldAdded: true,
+            clientUuid: clientUuid, updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        try context.save()
+
+        // The server's own projection of that same row, nested in its building's tree: a
+        // DIFFERENT `id` (its real primary key), the same `clientUuid`, an updated label.
+        stub.buildingsResult = .success([
+            BuildingDTO(id: "bldg-1", name: "Main House", buildingIndex: 1, notes: nil, updatedAt: Date(timeIntervalSince1970: 2_000), elevations: [
+                ElevationDTO(
+                    id: "server-real-elev-999", buildingId: "bldg-1", elevationNumber: 3, numberLabel: nil,
+                    label: "New Wall (confirmed)", bearing: nil, facing: "North", fieldAdded: true,
+                    updatedAt: Date(timeIntervalSince1970: 2_000), clientUuid: clientUuid
+                ),
+            ])
+        ])
+        let engine = SyncEngine(backend: stub, modelContext: context, watermarks: SyncWatermarks(defaults: freshDefaults()))
+
+        await engine.syncAll()
+
+        let elevations = try context.fetch(FetchDescriptor<Elevation>())
+        XCTAssertEqual(elevations.count, 1, "must reconcile the existing clientUuid row, never insert a duplicate")
+        let elevation = try XCTUnwrap(elevations.first)
+        XCTAssertEqual(elevation.id, clientUuid, "id is never remapped to the server's own row id")
+        XCTAssertEqual(elevation.label, "New Wall (confirmed)")
+        XCTAssertEqual(elevation.facing, "North")
+
+        let buildings = try context.fetch(FetchDescriptor<Building>())
+        XCTAssertEqual(buildings.count, 1, "the building itself upserts normally, unaffected by the elevation's dedup key")
+    }
+
+    func testSyncBuildingsFallsBackToIdMatchForElevationWhenDtoHasNoClientUuid() async throws {
+        // An estimator-created elevation never went through a field-add, so its wire
+        // projection's `clientUuid` is nil — must still dedup by `id`, exactly like before the
+        // M5a write lane.
+        let stub = StubSyncBackend()
+        let context = try makeContext()
+        context.insert(JobSummary(id: "job-1", name: "Job job-1", status: "OPEN", updatedAt: Date(timeIntervalSince1970: 1_000)))
+        context.insert(Elevation(
+            id: "office-elev-1", buildingId: "bldg-1", elevationNumber: 1, label: "North Wall", fieldAdded: false,
+            updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        try context.save()
+
+        stub.buildingsResult = .success([
+            BuildingDTO(id: "bldg-1", name: "Main House", buildingIndex: 1, notes: nil, updatedAt: Date(timeIntervalSince1970: 2_000), elevations: [
+                ElevationDTO(
+                    id: "office-elev-1", buildingId: "bldg-1", elevationNumber: 1, numberLabel: nil, label: "North Wall (repainted)",
+                    bearing: nil, facing: nil, fieldAdded: false, updatedAt: Date(timeIntervalSince1970: 2_000), clientUuid: nil
+                ),
+            ])
+        ])
+        let engine = SyncEngine(backend: stub, modelContext: context, watermarks: SyncWatermarks(defaults: freshDefaults()))
+
+        await engine.syncAll()
+
+        let elevations = try context.fetch(FetchDescriptor<Elevation>())
+        XCTAssertEqual(elevations.count, 1)
+        XCTAssertEqual(elevations.first?.id, "office-elev-1")
+        XCTAssertEqual(elevations.first?.label, "North Wall (repainted)")
+    }
+
+    func testSyncBuildingsInsertsFreshElevationKeyedByClientUuidNotServerRowId() async throws {
+        // An elevation this device has never seen before, originated via a DIFFERENT device's
+        // field-add — a fresh insert must still key by `clientUuid`, not the server's own row
+        // id, so a later sync of the same row matches it instead of duplicating.
+        let stub = StubSyncBackend()
+        let context = try makeContext()
+        context.insert(JobSummary(id: "job-1", name: "Job job-1", status: "OPEN", updatedAt: Date(timeIntervalSince1970: 1_000)))
+        try context.save()
+
+        let clientUuid = UUID().uuidString
+        stub.buildingsResult = .success([
+            BuildingDTO(id: "bldg-1", name: "Main House", buildingIndex: 1, notes: nil, updatedAt: Date(timeIntervalSince1970: 1_000), elevations: [
+                ElevationDTO(
+                    id: "server-real-elev-1", buildingId: "bldg-1", elevationNumber: 4, numberLabel: nil, label: "Garage Wall",
+                    bearing: nil, facing: nil, fieldAdded: true, updatedAt: Date(timeIntervalSince1970: 1_000), clientUuid: clientUuid
+                ),
+            ])
+        ])
+        let engine = SyncEngine(backend: stub, modelContext: context, watermarks: SyncWatermarks(defaults: freshDefaults()))
+
+        await engine.syncAll()
+
+        let elevations = try context.fetch(FetchDescriptor<Elevation>())
+        XCTAssertEqual(elevations.count, 1)
+        XCTAssertEqual(elevations.first?.id, clientUuid, "fresh insert keys by clientUuid, not the server's row id")
+        XCTAssertEqual(elevations.first?.clientUuid, clientUuid)
+    }
+}

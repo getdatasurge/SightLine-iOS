@@ -1,12 +1,16 @@
 import Foundation
 import SwiftData
 
-/// Building/Elevation read-only local mirrors (M5a). A job's buildings are almost always
-/// estimator-created on the web before a technician arrives (office already ran the walk-mode
-/// trace or a manual add) — this slice only syncs that hierarchy down for on-device viewing, via
-/// `SyncEngine.syncBuildings()`. No `clientUuid`/on-device creation yet: field-added elevations
-/// and pane placement are a later M5 write lane (`.superpowers/m5-survey-scout.md` §5, M5a scope
-/// note) — every row here originates server-side and is only ever upserted, never written back.
+/// Building/Elevation local mirrors (M5a). A job's buildings are almost always estimator-created
+/// on the web before a technician arrives (office already ran the walk-mode trace or a manual
+/// add) — most rows here still only ever arrive via `SyncEngine.syncBuildings()`. As of the M5a
+/// write lane, `Elevation` can ALSO originate on-device: `ElevationActions.addElevation` mints a
+/// field-added row directly (`fieldAdded: true`, `clientUuid` pinned to its own `id` forever —
+/// see that method's doc comment) and `ElevationActions.assignSurface` places a `Surface` onto
+/// one, both replayed through the offline outbox (`OutboxWorker`) exactly like `WorkLog`'s
+/// check-in/check-out. `Building` itself is still read-only — nothing in this slice creates one
+/// on-device, and assign-pane UI isn't wired into any view yet (`JobElevationsView.swift`'s doc
+/// comment) — only the write plumbing landed this pass.
 
 /// A survey building, scoped to one job. Field list per `.superpowers/sdd/m5a-backend-report.md`
 /// / `.superpowers/m5-survey-scout.md` §1 — price-blind, no address/footprint/map fields (those
@@ -43,6 +47,18 @@ final class Elevation {
     var bearing: Int?
     var facing: String?
     var fieldAdded: Bool
+    /// The field-added identity key (M5a), mirroring `WorkLog.clientUuid`'s role: minted by
+    /// `ElevationActions.addElevation` for an offline create, doubling as this row's own `id`
+    /// forever from that instant on (never remapped once the outbox reconciles the server's
+    /// row — see that method's doc comment). `nil` for the common case, an estimator-planned
+    /// elevation that never went through a field-add. Kept optional (unlike `WorkLog
+    /// .clientUuid`, always non-nil): `Elevation` already had rows on-device before this column
+    /// existed (the M5a read-only sync shipped first), so a non-optional column would need a
+    /// shared placeholder default applied to every pre-existing row on lightweight migration —
+    /// a uniqueness hazard `WorkLog` never risked, since it was born with this column from day
+    /// one. Identity/dedup logic (`SyncEngine.syncBuildings`, `OutboxWorker.reconcileElevation`)
+    /// therefore always matches on `id`, never this field — see both doc comments.
+    var clientUuid: String?
     var updatedAt: Date
 
     init(
@@ -54,6 +70,7 @@ final class Elevation {
         bearing: Int? = nil,
         facing: String? = nil,
         fieldAdded: Bool,
+        clientUuid: String? = nil,
         updatedAt: Date
     ) {
         self.id = id
@@ -64,6 +81,7 @@ final class Elevation {
         self.bearing = bearing
         self.facing = facing
         self.fieldAdded = fieldAdded
+        self.clientUuid = clientUuid
         self.updatedAt = updatedAt
     }
 }

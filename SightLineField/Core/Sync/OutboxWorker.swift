@@ -38,10 +38,32 @@ struct PhotoUploadPayload: Codable, Sendable, Equatable {
     let imageData: Data
 }
 
+/// Wire body for a queued `POST /buildings/{id}/elevations` replay (M5a) — mirrors
+/// `SurveyWriteGateway.createElevation`'s parameters exactly, `clientUuid` included for the
+/// same reason `CheckInPayload`'s doc comment gives: the live call needs it as an argument, not
+/// something it can read back out of anything else.
+struct ElevationCreatePayload: Codable, Sendable, Equatable {
+    let buildingId: String
+    let label: String
+    let facing: String?
+    let clientUuid: String
+}
+
+/// Wire body for a queued `POST /surfaces/{id}/assign` replay (M5a) — mirrors
+/// `SurveyWriteGateway.assignSurface`'s parameters exactly. No `clientUuid`: the route is
+/// naturally idempotent (see that method's doc comment), so there's no idempotency key to
+/// thread through a replay.
+struct SurfaceAssignPayload: Codable, Sendable, Equatable {
+    let surfaceId: String
+    let buildingId: String
+    let elevationId: String
+}
+
 /// The operations a `SyncOutbox` row can target. Raw values are what `WorkLogActions`/
-/// `PhotoActions` store verbatim in `SyncOutbox.endpoint`; `OutboxWorker.drain()` dispatches on
-/// them to pick both the payload type to decode and where to replay: `WorkLogGateway` for the
-/// first two, `OutboxWorker.photoGateway` for the third (M4b).
+/// `PhotoActions`/`ElevationActions` store verbatim in `SyncOutbox.endpoint`; `OutboxWorker
+/// .drain()` dispatches on them to pick both the payload type to decode and where to replay:
+/// `WorkLogGateway` for the first two, `OutboxWorker.photoGateway` for the third (M4b),
+/// `OutboxWorker.surveyGateway` for the last two (M5a).
 enum OutboxEndpoint: String, Sendable {
     case checkIn = "work-logs/check-in"
     case checkOut = "work-logs/check-out"
@@ -51,6 +73,12 @@ enum OutboxEndpoint: String, Sendable {
     /// M4b (matches the spec's "at-least-once" outbox model; no worse than any other endpoint
     /// replaying after a lost response), flagged here rather than silently assumed exactly-once.
     case photoUpload = "uploads"
+    /// `POST /buildings/{id}/elevations` (M5a, field-added elevation). `clientUuid`-keyed —
+    /// idempotent on replay, same shape as check-in.
+    case elevationCreate = "buildings/elevations"
+    /// `POST /surfaces/{id}/assign` (M5a, pane→elevation placement). No idempotency key needed
+    /// — see `SurveyWriteGateway.assignSurface`'s doc comment.
+    case surfaceAssign = "surfaces/assign"
 }
 
 // MARK: - OutboxWorker
@@ -149,6 +177,13 @@ final class OutboxWorker {
     /// wires one at all — just stays queued instead of taking down the whole drain pass (or
     /// blocking unrelated check-in/check-out rows behind it).
     var photoGateway: PhotoUploadGateway?
+
+    /// Additive dependency for M5a (survey writes) — same reasoning as `photoGateway` above:
+    /// not an `init` parameter, so `WorkLogActions`'s `OutboxWorker(gateway:modelContext:)` call
+    /// site (and every existing test) keeps compiling unchanged. `nil` until the composition
+    /// root sets it post-construction; `attempt()` treats an `.elevationCreate`/`.surfaceAssign`
+    /// row with no gateway wired as a transient, non-pass-stopping failure rather than crashing.
+    var surveyGateway: SurveyWriteGateway?
 
     init(gateway: WorkLogGateway, modelContext: ModelContext) {
         self.gateway = gateway
@@ -331,6 +366,35 @@ final class OutboxWorker {
             } catch {
                 return classify(error)
             }
+        case .elevationCreate:
+            guard let payload = try? JSONDecoder().decode(ElevationCreatePayload.self, from: item.payload) else {
+                return .permanentFailure("undecodable elevation-create payload")
+            }
+            guard let surveyGateway else {
+                return .transientFailure("survey gateway not configured", stopsPass: false)
+            }
+            do {
+                let dto = try await surveyGateway.createElevation(
+                    buildingId: payload.buildingId, label: payload.label, facing: payload.facing, clientUuid: payload.clientUuid
+                )
+                reconcileElevation(dto, clientUuid: payload.clientUuid)
+                return .success
+            } catch {
+                return classify(error)
+            }
+        case .surfaceAssign:
+            guard let payload = try? JSONDecoder().decode(SurfaceAssignPayload.self, from: item.payload) else {
+                return .permanentFailure("undecodable surface-assign payload")
+            }
+            guard let surveyGateway else {
+                return .transientFailure("survey gateway not configured", stopsPass: false)
+            }
+            do {
+                try await surveyGateway.assignSurface(surfaceId: payload.surfaceId, buildingId: payload.buildingId, elevationId: payload.elevationId)
+                return .success
+            } catch {
+                return classify(error)
+            }
         }
     }
 
@@ -345,7 +409,7 @@ final class OutboxWorker {
             return (try? JSONDecoder().decode(CheckInPayload.self, from: item.payload))?.clientUuid
         case .checkOut:
             return (try? JSONDecoder().decode(CheckOutPayload.self, from: item.payload))?.workLogClientUuid
-        case .photoUpload:
+        case .photoUpload, .elevationCreate, .surfaceAssign:
             return nil
         }
     }
@@ -443,5 +507,52 @@ final class OutboxWorker {
         return rows.contains { row in
             (try? JSONDecoder().decode(CheckOutPayload.self, from: row.payload))?.workLogClientUuid == workLogClientUuid
         }
+    }
+
+    // MARK: - Reconcile (Elevation)
+
+    /// Upserts the server's authoritative elevation row after a successful `.elevationCreate`
+    /// replay — mirrors `reconcile(_:clientUuid:source:)`'s WorkLog precedent, but keyed against
+    /// `Elevation.id` rather than a `clientUuid` column: `ElevationActions.addElevation`
+    /// guarantees `id == clientUuid` for every field-added row from the moment it's minted (see
+    /// that method's doc comment), so matching on `id` finds the identical optimistic row a
+    /// `clientUuid` match would — without an equality comparison against `Elevation.clientUuid`,
+    /// which is `nil` for most rows (`SurveyModels.swift`'s doc comment explains why that column
+    /// stays optional). `id` is never reassigned here, in either branch — no remapping to the
+    /// server's own `dto.id`, which is echoed back but otherwise unused, exactly like `WorkLog`'s
+    /// `reconcile`. A `SyncEngine.syncBuildings` pass that later re-fetches this same elevation
+    /// (now with the identical `clientUuid` echoed back on the wire) upserts by that same key
+    /// (`dto.clientUuid ?? dto.id`) against the same `id` — see that method's own doc comment —
+    /// so a create followed by a sync never produces two local rows for what the server
+    /// considers one elevation.
+    private func reconcileElevation(_ dto: ElevationDTO, clientUuid: String) {
+        if let model = try? modelContext.fetch(FetchDescriptor<Elevation>(
+            predicate: #Predicate<Elevation> { $0.id == clientUuid }
+        )).first {
+            model.buildingId = dto.buildingId
+            model.elevationNumber = dto.elevationNumber
+            model.numberLabel = dto.numberLabel
+            model.label = dto.label
+            model.bearing = dto.bearing
+            model.facing = dto.facing
+            model.fieldAdded = dto.fieldAdded
+            model.clientUuid = dto.clientUuid
+            model.updatedAt = dto.updatedAt
+        } else {
+            modelContext.insert(Elevation(
+                id: clientUuid,
+                buildingId: dto.buildingId,
+                elevationNumber: dto.elevationNumber,
+                numberLabel: dto.numberLabel,
+                label: dto.label,
+                bearing: dto.bearing,
+                facing: dto.facing,
+                fieldAdded: dto.fieldAdded,
+                clientUuid: dto.clientUuid,
+                updatedAt: dto.updatedAt
+            ))
+        }
+        // Covered by the same `save()` the caller (`runPass`) makes right after this row's own
+        // outcome — one write for both, not two.
     }
 }
