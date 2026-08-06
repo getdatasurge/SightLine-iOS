@@ -30,6 +30,8 @@ final class AppDependencies {
     let biometricGate: BiometricGate
     let backgroundRefresher: BackgroundRefresher
     let photoActions: PhotoActions
+    let elevationActions: ElevationActions
+    let surfaceActions: SurfaceActions
 
     init(environment: AppEnvironment = .resolve(), inMemoryStore: Bool = false) {
         let tokenStore = KeychainTokenStore()
@@ -80,6 +82,17 @@ final class AppDependencies {
         self.photoActions = PhotoActions(outboxWorker: workLogActions.outboxWorker, modelContext: container.mainContext)
         self.backgroundRefresher = BackgroundRefresher(outboxWorker: workLogActions.outboxWorker, syncEngine: syncEngine)
 
+        // M5a: field-added elevation creation + pane assignment replay through the same one
+        // outbox `WorkLogActions`/`PhotoActions` drain, so `surveyGateway` is set on that shared
+        // worker rather than a second one racing it.
+        workLogActions.outboxWorker.surveyGateway = LiveSurveyWriteGateway(client: client)
+        self.elevationActions = ElevationActions(outboxWorker: workLogActions.outboxWorker, modelContext: container.mainContext)
+
+        // M5b: field pane capture replays through the same shared outbox; the capture gateway
+        // rides beside `surveyGateway`/`photoGateway` on that one worker.
+        workLogActions.outboxWorker.surfaceCaptureGateway = LiveSurfaceCaptureGateway(client: client)
+        self.surfaceActions = SurfaceActions(outboxWorker: workLogActions.outboxWorker, modelContext: container.mainContext)
+
         // Mirrors the `-uitest-reset` isolation above: disabled entirely so an automated launch
         // never blocks on a biometric prompt it has no way to satisfy.
         self.biometricGate = BiometricGate(enabled: !uitestReset)
@@ -108,6 +121,11 @@ final class AppDependencies {
             try? context.delete(model: WorkType.self)
             try? context.delete(model: WorkLog.self)
             try? context.delete(model: Surface.self)
+            try? context.delete(model: Building.self)
+            try? context.delete(model: Elevation.self)
+            // A shared installer device must never replay the prior account's queued writes
+            // under the next technician: drop the outbox rows too, not just the synced data.
+            try? context.delete(model: SyncOutbox.self)
         }
     }
 }

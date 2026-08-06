@@ -15,6 +15,8 @@ struct SightLineFieldApp: App {
                 .environment(dependencies.workLogActions.outboxWorker)
                 .environment(dependencies.biometricGate)
                 .environment(dependencies.photoActions)
+                .environment(dependencies.elevationActions)
+                .environment(dependencies.surfaceActions)
                 .environment(dependencies.connectivity)
                 .environment(\.apiClient, dependencies.client)
                 .modelContainer(dependencies.modelContainer)
