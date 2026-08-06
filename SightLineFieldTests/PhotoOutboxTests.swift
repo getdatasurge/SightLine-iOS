@@ -76,7 +76,7 @@ final class PhotoOutboxTests: XCTestCase {
 
         await waitUntil { photoGateway.uploadCalls.count == 1 }
         XCTAssertEqual(photoGateway.uploadCalls.count, 1, "enqueuePhoto must trigger its own drain, offline-first, without the caller draining itself")
-        XCTAssertEqual(item.state, OutboxState.done.rawValue)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "a successfully-synced row is purged (OutboxWorker Minor #4), never left `.done`")
     }
 
     func testEnqueuePhotoMintsAFreshClientUuidPerCall() throws {
@@ -94,7 +94,7 @@ final class PhotoOutboxTests: XCTestCase {
 
     // MARK: - OutboxWorker.drain(): .photoUpload happy path
 
-    func testDrainWithSuccessStubMarksRowDoneAndCallsUploadWithDecodedFields() async throws {
+    func testDrainWithSuccessStubPurgesRowAndCallsUploadWithDecodedFields() async throws {
         let context = try makeContext()
         let imageData = Data([0x01, 0x02, 0x03])
         insertPhotoItem(
@@ -119,10 +119,7 @@ final class PhotoOutboxTests: XCTestCase {
         XCTAssertEqual(call.mimeType, "image/jpeg")
         XCTAssertEqual(call.imageData, imageData)
 
-        let items = try context.fetch(FetchDescriptor<SyncOutbox>())
-        XCTAssertEqual(items.count, 1)
-        XCTAssertEqual(items.first?.state, OutboxState.done.rawValue)
-        XCTAssertNil(items.first?.lastError)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "a successfully-synced row is purged (OutboxWorker Minor #4), never left `.done`")
     }
 
     // MARK: - OutboxWorker.drain(): 4xx-conflict is immediate, not gated by attempts
@@ -212,6 +209,10 @@ final class PhotoOutboxTests: XCTestCase {
         await worker.drain()
 
         XCTAssertEqual(workLogGateway.checkInCalls.count, 1, "a nil photoGateway must not stop unrelated rows behind it from processing")
-        XCTAssertEqual(checkInItem.state, OutboxState.done.rawValue)
+        let checkInEndpoint = OutboxEndpoint.checkIn.rawValue
+        let remainingCheckIns = try context.fetch(FetchDescriptor<SyncOutbox>(
+            predicate: #Predicate<SyncOutbox> { $0.endpoint == checkInEndpoint }
+        ))
+        XCTAssertTrue(remainingCheckIns.isEmpty, "the check-in row succeeded and is purged (OutboxWorker Minor #4), never left `.done`")
     }
 }

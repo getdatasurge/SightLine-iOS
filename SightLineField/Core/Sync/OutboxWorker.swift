@@ -61,8 +61,10 @@ enum OutboxEndpoint: String, Sendable {
 /// (`SyncOutbox.createdAt` — its FIFO ordinal) whenever `drain()` runs.
 ///
 /// Per-item outcome, per `docs/superpowers/specs/2026-08-05-m4-offline-outbox.md`:
-/// - `2xx` → `.done`, and the local `WorkLog` is reconciled from the server's row (keyed by
-///   `clientUuid`, never the server's own row id — see `reconcile`'s doc comment).
+/// - `2xx` → the row is deleted (M4a-review Minor #4 — nothing ever reads a `.done` row again,
+///   so leaving it around just grows the table unbounded) and the local `WorkLog` is reconciled
+///   from the server's row (keyed by `clientUuid`, never the server's own row id — see
+///   `reconcile`'s doc comment).
 /// - `400/403/404/409` ("4xx-conflict") → `.conflict` immediately, not gated by `attempts` — a
 ///   business rejection that replaying the identical request will never turn into a success.
 /// - `network` / `401` / `429` / `5xx` (transient/environmental) → `attempts += 1`, stays
@@ -74,17 +76,69 @@ enum OutboxEndpoint: String, Sendable {
 ///   point burning through each one's `attempts` budget over a single offline blip. A lone
 ///   `429`/`5xx` on one item doesn't imply the same about the rest, so those don't stop the loop.
 ///
+/// **Dependent ordering within a pass** (m4a-review Important #2): a check-out only ever makes
+/// sense once its check-in has actually landed server-side. If an earlier row in this same pass
+/// (by construction, always a check-in — nothing else has same-clientUuid dependents) fails —
+/// transiently (stays `.pending`/hits `maxAttempts`) or permanently (4xx) — its `clientUuid` is
+/// remembered in `runPass`'s `failedWorkLogClientUuidsThisPass`, and every later row targeting
+/// that same work-log is *skipped* (left exactly as fetched) rather than attempted: replaying a
+/// check-out against a work-log the server never created would 404 → `classify` → a *permanent*
+/// `.conflict` the check-in's own later success can never un-stick. A skipped row simply waits
+/// for the next `drain()` call.
+///
+/// **Re-fetch until stable** (m4a-review Minor #5): a row enqueued *during* this call — e.g. a
+/// second `WorkLogActions.checkOut` from another view while this pass is mid-`await` — misses
+/// the fetch snapshot its own fire-and-forget `Task { drain() }` no-ops against (re-entrancy
+/// guard), and would otherwise sit untouched until the next external trigger. `drain()` re-fetches
+/// after every pass and loops again *only* while the fetched id set actually changed since the
+/// last pass — a row still `.pending` purely because it genuinely failed again (or was deferred
+/// per the above) does not get hammered in a tight loop; `Self.maxPassesPerDrain` is a hard,
+/// purely-defensive cap on top of that, never expected to bind in practice.
+///
 /// Re-entrant-safe: `drain()` called while already draining is a no-op, so triggering it from
 /// several places at once (foreground, reconnect, every `WorkLogActions` enqueue) never runs two
-/// passes over the same rows concurrently.
+/// passes over the same rows concurrently. `isHeld` (set externally, e.g. a UI-test launch hook)
+/// makes it a no-op too — checked again between internal passes, not just at entry, so flipping
+/// it mid-drain stops the *next* pass from starting. Cooperatively cancellable: `Task.isCancelled`
+/// is checked between passes and between each item within a pass (not while an item's own
+/// request is actually in flight — an already-started request is allowed to finish, only a
+/// not-yet-started one is skipped), so a `BackgroundRefresher` expiry stops this promptly instead
+/// of running the whole queue to completion regardless (ios-units-review Important).
 @MainActor
 @Observable
 final class OutboxWorker {
     private(set) var isDraining = false
 
+    /// External pause switch — `drain()` (both the initial call and every internal re-fetch
+    /// pass) no-ops while this is `true`. Not used by anything in this file; exists for a UI
+    /// test to freeze outbox activity so it can assert on a stable "N pending" state without
+    /// racing a live drain (set by the composition root from a launch-argument hook).
+    var isHeld = false
+
+    /// Rows still waiting on a successful replay — queued or actively being sent. A stored,
+    /// `@Observable`-tracked mirror of a `fetchCount` query (ios-units-review Minor: the old
+    /// computed-property version read no stored state, so SwiftUI registered no dependency and
+    /// `SettingsSheet` never refreshed while open), recomputed by `refreshCounts()` after every
+    /// `modelContext.save()` this class makes, plus once more from `WorkLogActions.enqueue`
+    /// after *its* save (a new row lands directly on the shared context, not through this
+    /// class) — so a technician watching `SettingsSheet` sees this tick the instant a
+    /// check-in/check-out/photo is queued or resolved, not just once a drain pass happens to run.
+    private(set) var pendingCount = 0
+
+    /// Rows that gave up — a permanent rejection or `maxAttempts` exhausted — and need either a
+    /// human to look or a manual `retry(clientUuid:)`. Same stored/reactive shape as
+    /// `pendingCount`, same reasoning.
+    private(set) var conflictCount = 0
+
     private let gateway: WorkLogGateway
     private let modelContext: ModelContext
     private let maxAttempts = 6
+
+    /// Hard cap on internal re-fetch passes within one `drain()` call — see the class doc
+    /// comment's "Re-fetch until stable" section. Generous on purpose: real usage never stacks
+    /// more than a handful of mid-pass enqueues, so this is pure defense-in-depth against a
+    /// pathological loop, not a number tuned to any expected workload.
+    private static let maxPassesPerDrain = 20
 
     /// Additive dependency for M4b (photo outbox) — deliberately not an `init` parameter, so
     /// `WorkLogActions`'s existing `OutboxWorker(gateway:modelContext:)` call site (and every
@@ -99,64 +153,114 @@ final class OutboxWorker {
     init(gateway: WorkLogGateway, modelContext: ModelContext) {
         self.gateway = gateway
         self.modelContext = modelContext
+        refreshCounts()
     }
 
-    /// Rows still waiting on a successful replay — queued or actively being sent.
-    var pendingCount: Int {
+    /// Recomputes `pendingCount`/`conflictCount` from the store. `OutboxWorker` calls this
+    /// itself after every save it makes (via `saveAndRefreshCounts()`); `WorkLogActions.enqueue`
+    /// calls it directly after its own save, since that row lands on the shared `modelContext`
+    /// without going through this class at all.
+    func refreshCounts() {
         let pending = OutboxState.pending.rawValue
         let inFlight = OutboxState.inFlight.rawValue
-        return (try? modelContext.fetchCount(FetchDescriptor<SyncOutbox>(
+        let conflict = OutboxState.conflict.rawValue
+        pendingCount = (try? modelContext.fetchCount(FetchDescriptor<SyncOutbox>(
             predicate: #Predicate<SyncOutbox> { $0.state == pending || $0.state == inFlight }
         ))) ?? 0
-    }
-
-    /// Rows that gave up — a permanent rejection or `maxAttempts` exhausted — and need either a
-    /// human to look or a manual `retry(clientUuid:)`.
-    var conflictCount: Int {
-        let conflict = OutboxState.conflict.rawValue
-        return (try? modelContext.fetchCount(FetchDescriptor<SyncOutbox>(
+        conflictCount = (try? modelContext.fetchCount(FetchDescriptor<SyncOutbox>(
             predicate: #Predicate<SyncOutbox> { $0.state == conflict }
         ))) ?? 0
     }
 
-    /// Replays every queued item oldest-first: `.pending` rows, plus any `.inFlight` left over
-    /// from a run that never got to record an outcome (e.g. the app was killed mid-request) —
-    /// self-healing, since nothing else ever revives a stuck `.inFlight` row. See the class doc
-    /// comment for the per-item outcome rules.
+    /// `modelContext.save()` + `refreshCounts()` in one call — every mutating save this class
+    /// makes goes through this rather than a bare `try? modelContext.save()`, so `pendingCount`/
+    /// `conflictCount` never drift from what's actually persisted.
+    private func saveAndRefreshCounts() {
+        try? modelContext.save()
+        refreshCounts()
+    }
+
+    /// Replays every queued item oldest-first, re-fetching and looping until the queue is
+    /// stable: `.pending` rows, plus any `.inFlight` left over from a run that never got to
+    /// record an outcome (e.g. the app was killed mid-request) — self-healing, since nothing
+    /// else ever revives a stuck `.inFlight` row. See the class doc comment for the full
+    /// per-item outcome rules, the dependent-ordering guard, the re-fetch loop, and cancellation.
     func drain() async {
-        guard !isDraining else { return }
+        guard !isDraining, !isHeld else { return }
         isDraining = true
         defer { isDraining = false }
 
+        var previouslyFetchedIDs: Set<PersistentIdentifier>?
+        for _ in 0..<Self.maxPassesPerDrain {
+            guard !isHeld, !Task.isCancelled else { return }
+
+            guard let items = fetchPendingOrInFlight(), !items.isEmpty else { return }
+
+            let fetchedIDs = Set(items.map(\.persistentModelID))
+            if fetchedIDs == previouslyFetchedIDs { return }
+            previouslyFetchedIDs = fetchedIDs
+
+            if await runPass(items) { return }
+        }
+    }
+
+    private func fetchPendingOrInFlight() -> [SyncOutbox]? {
         let pending = OutboxState.pending.rawValue
         let inFlight = OutboxState.inFlight.rawValue
         var descriptor = FetchDescriptor<SyncOutbox>(
             predicate: #Predicate<SyncOutbox> { $0.state == pending || $0.state == inFlight }
         )
         descriptor.sortBy = [SortDescriptor(\.createdAt)]
-        guard let items = try? modelContext.fetch(descriptor) else { return }
+        return try? modelContext.fetch(descriptor)
+    }
+
+    /// One FIFO pass over `items` (a fetch snapshot `drain()` took at the top of a loop
+    /// iteration). Returns `true` when `drain()` should stop entirely rather than looping for
+    /// another pass — a `network`/`401` transient failure (see the class doc comment) or a
+    /// cancellation observed between items — `false` when the pass ran to completion (possibly
+    /// with some rows deferred as an unresolved dependent, or left `.pending` for a bounded
+    /// retry).
+    private func runPass(_ items: [SyncOutbox]) async -> Bool {
+        var failedWorkLogClientUuidsThisPass: Set<String> = []
 
         for item in items {
+            if Task.isCancelled { return true }
+
+            if let workLogUuid = workLogClientUuid(for: item), failedWorkLogClientUuidsThisPass.contains(workLogUuid) {
+                // This row's dependency (its check-in) didn't reach the server this pass —
+                // replaying it now would 404 into a permanent conflict it can never recover
+                // from on its own. Leave it exactly as fetched; it retries next pass.
+                continue
+            }
+
             item.state = OutboxState.inFlight.rawValue
-            try? modelContext.save()
+            saveAndRefreshCounts()
 
             switch await attempt(item) {
             case .success:
-                item.state = OutboxState.done.rawValue
-                item.lastError = nil
-                try? modelContext.save()
+                // Minor #4: nothing ever reads a `.done` row again — delete rather than retain
+                // it, so the table doesn't grow unbounded over the app's life.
+                modelContext.delete(item)
+                saveAndRefreshCounts()
             case .permanentFailure(let message):
                 item.state = OutboxState.conflict.rawValue
                 item.lastError = message
-                try? modelContext.save()
+                saveAndRefreshCounts()
+                if let workLogUuid = workLogClientUuid(for: item) {
+                    failedWorkLogClientUuidsThisPass.insert(workLogUuid)
+                }
             case .transientFailure(let message, let stopsPass):
                 item.attempts += 1
                 item.lastError = message
                 item.state = item.attempts >= maxAttempts ? OutboxState.conflict.rawValue : OutboxState.pending.rawValue
-                try? modelContext.save()
-                if stopsPass { return }
+                saveAndRefreshCounts()
+                if let workLogUuid = workLogClientUuid(for: item) {
+                    failedWorkLogClientUuidsThisPass.insert(workLogUuid)
+                }
+                if stopsPass { return true }
             }
         }
+        return false
     }
 
     /// Un-sticks a `.conflict` row so the next `drain()` picks it back up. Resets `attempts` to
@@ -173,7 +277,7 @@ final class OutboxWorker {
         item.state = OutboxState.pending.rawValue
         item.attempts = 0
         item.lastError = nil
-        try? modelContext.save()
+        saveAndRefreshCounts()
     }
 
     // MARK: - Per-item dispatch
@@ -195,7 +299,7 @@ final class OutboxWorker {
             }
             do {
                 let dto = try await gateway.checkIn(jobId: payload.jobId, workTypeId: payload.workTypeId, notes: payload.notes, clientUuid: payload.clientUuid)
-                reconcile(dto, clientUuid: payload.clientUuid)
+                reconcile(dto, clientUuid: payload.clientUuid, source: .checkIn)
                 return .success
             } catch {
                 return classify(error)
@@ -206,7 +310,7 @@ final class OutboxWorker {
             }
             do {
                 let dto = try await gateway.checkOut(workLogClientUuid: payload.workLogClientUuid, quantity: payload.quantity, notes: payload.notes)
-                reconcile(dto, clientUuid: payload.workLogClientUuid)
+                reconcile(dto, clientUuid: payload.workLogClientUuid, source: .checkOut)
                 return .success
             } catch {
                 return classify(error)
@@ -227,6 +331,22 @@ final class OutboxWorker {
             } catch {
                 return classify(error)
             }
+        }
+    }
+
+    /// The work-log `clientUuid` a check-in/check-out row targets — used only to detect
+    /// same-pass dependency ordering (see the class doc comment's "Dependent ordering" section).
+    /// `nil` for a photo upload or an unrecognized endpoint, neither of which has a same-pass
+    /// dependent to protect.
+    private func workLogClientUuid(for item: SyncOutbox) -> String? {
+        guard let endpoint = OutboxEndpoint(rawValue: item.endpoint) else { return nil }
+        switch endpoint {
+        case .checkIn:
+            return (try? JSONDecoder().decode(CheckInPayload.self, from: item.payload))?.clientUuid
+        case .checkOut:
+            return (try? JSONDecoder().decode(CheckOutPayload.self, from: item.payload))?.workLogClientUuid
+        case .photoUpload:
+            return nil
         }
     }
 
@@ -265,10 +385,23 @@ final class OutboxWorker {
     /// directly rather than through `WorkLogActions`, or another device's check-in is only now
     /// being seen) falls back to inserting one, still keyed by `clientUuid` rather than the
     /// server's own id, for the same reason.
-    private func reconcile(_ dto: WorkLogDTO, clientUuid: String) {
+    ///
+    /// `source` guards against m4a-review Minor #3: a check-in replay's response DTO is always
+    /// still CHECKED_IN (the server hasn't processed a queued check-out yet, or this call
+    /// wouldn't be happening), so applying it unconditionally would clobber an already-optimistic
+    /// CHECKED_OUT local row back to CHECKED_IN whenever that check-out hasn't *also* landed in
+    /// this same pass (e.g. the connection drops between the two, or the check-out is still
+    /// waiting behind other rows). Only the check-in path (`source == .checkIn`) needs this
+    /// guard — a check-out's own reconcile is always the authoritative "this really happened"
+    /// signal and must apply unconditionally, including when it's reconciling the very row this
+    /// guard is protecting.
+    private func reconcile(_ dto: WorkLogDTO, clientUuid: String, source: OutboxEndpoint) {
         if let model = try? modelContext.fetch(FetchDescriptor<WorkLog>(
             predicate: #Predicate<WorkLog> { $0.clientUuid == clientUuid }
         )).first {
+            if source == .checkIn, model.status == "CHECKED_OUT", hasQueuedCheckOut(forWorkLogClientUuid: clientUuid) {
+                return
+            }
             model.jobId = dto.jobId
             model.technicianId = dto.technicianId
             model.workTypeId = dto.workTypeId
@@ -293,7 +426,22 @@ final class OutboxWorker {
                 updatedAt: dto.updatedAt
             ))
         }
-        // Covered by the same `save()` the caller (`drain()`) makes right after recording this
-        // item's own `.done` transition — one write for both, not two.
+        // Covered by the same `save()` the caller (`runPass`) makes right after this row's own
+        // outcome — one write for both, not two.
+    }
+
+    /// Whether a not-yet-successfully-synced check-out row targets `workLogClientUuid` — a
+    /// presence check, not a state filter, because a *successful* check-out row is deleted
+    /// immediately (Minor #4): mere existence in the table already means "hasn't landed yet",
+    /// whether it's `.pending`, `.inFlight`, or even `.conflict` (needs a manual retry, but the
+    /// local CHECKED_OUT state is still this technician's real intent until it does).
+    private func hasQueuedCheckOut(forWorkLogClientUuid workLogClientUuid: String) -> Bool {
+        let checkOut = OutboxEndpoint.checkOut.rawValue
+        guard let rows = try? modelContext.fetch(FetchDescriptor<SyncOutbox>(
+            predicate: #Predicate<SyncOutbox> { $0.endpoint == checkOut }
+        )) else { return false }
+        return rows.contains { row in
+            (try? JSONDecoder().decode(CheckOutPayload.self, from: row.payload))?.workLogClientUuid == workLogClientUuid
+        }
     }
 }

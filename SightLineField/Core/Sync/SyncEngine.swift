@@ -33,7 +33,11 @@ final class SyncEngine {
     /// technician who's, say, rate-limited on work-logs should still get their job list
     /// refreshed. `lastSyncedAt` advances to now if *any* collection completed; `lastSyncError`
     /// reflects only this pass (a clean pass clears a stale error from a previous one).
-    /// Re-entrant: a call while a sync is already running is a no-op.
+    /// Re-entrant: a call while a sync is already running is a no-op. Cooperatively cancellable
+    /// between collections (ios-units-review Important): `Task.isCancelled` is checked at the
+    /// top of every loop iteration, so a `BackgroundRefresher` expiry stops this before starting
+    /// the *next* collection rather than always running all six to completion regardless — a
+    /// collection already `await`ing mid-fetch when cancellation lands is allowed to finish.
     func syncAll() async {
         guard !isSyncing else { return }
         isSyncing = true
@@ -43,6 +47,7 @@ final class SyncEngine {
         var failureMessage: String?
 
         for collection in SyncCollection.allCases {
+            guard !Task.isCancelled else { break }
             do {
                 try await sync(collection)
                 succeededAny = true

@@ -1,5 +1,6 @@
 import XCTest
 import SwiftData
+import Observation
 @testable import SightLineField
 
 /// Fakes `WorkLogGateway` for direct `OutboxWorker.drain()` testing — no `WorkLogActions`
@@ -12,6 +13,18 @@ final class FakeWorkLogGateway: WorkLogGateway, @unchecked Sendable {
     var checkInResult: Result<WorkLogDTO, Error> = .failure(ApiError.decoding)
     var checkOutResult: Result<WorkLogDTO, Error> = .failure(ApiError.decoding)
 
+    /// Artificial delay inside `checkIn`, used to widen the overlap window for cancellation
+    /// tests (mirrors `StubSyncBackend.jobsDelayNanoseconds`, `SyncEngineTests.swift`).
+    var checkInDelayNanoseconds: UInt64 = 0
+
+    /// Fires synchronously from inside `checkIn`, before it returns — used by the re-drain-loop
+    /// test to insert a second outbox row on the same `ModelContext` while the first item's
+    /// request is conceptually "in flight", mirroring a second `WorkLogActions` call landing on
+    /// the shared context mid-pass. No real concurrency needed: everything here runs on the
+    /// same `@MainActor`, so a synchronous side effect from this closure is already sequenced
+    /// correctly relative to the rest of `drain()`.
+    var onCheckIn: (() -> Void)?
+
     private(set) var checkInCalls: [(jobId: String, workTypeId: String?, notes: String?, clientUuid: String)] = []
     private(set) var checkOutCalls: [(workLogClientUuid: String, quantity: Double?, notes: String?)] = []
     private(set) var callOrder: [String] = []
@@ -19,6 +32,10 @@ final class FakeWorkLogGateway: WorkLogGateway, @unchecked Sendable {
     func checkIn(jobId: String, workTypeId: String?, notes: String?, clientUuid: String) async throws -> WorkLogDTO {
         checkInCalls.append((jobId, workTypeId, notes, clientUuid))
         callOrder.append("checkIn:\(clientUuid)")
+        onCheckIn?()
+        if checkInDelayNanoseconds > 0 {
+            try? await Task.sleep(nanoseconds: checkInDelayNanoseconds)
+        }
         return try checkInResult.get()
     }
 
@@ -86,7 +103,7 @@ final class OutboxWorkerTests: XCTestCase {
 
     // MARK: - drain(): happy path
 
-    func testDrainHappyPathMarksDoneAndReconcilesLocalRow() async throws {
+    func testDrainHappyPathPurgesRowAndReconcilesLocalRow() async throws {
         let context = try makeContext()
         let workLogClientUuid = UUID().uuidString
         context.insert(WorkLog(
@@ -106,10 +123,7 @@ final class OutboxWorkerTests: XCTestCase {
         await worker.drain()
 
         XCTAssertEqual(gateway.checkInCalls.count, 1)
-        let items = try context.fetch(FetchDescriptor<SyncOutbox>())
-        XCTAssertEqual(items.count, 1)
-        XCTAssertEqual(items.first?.state, OutboxState.done.rawValue)
-        XCTAssertNil(items.first?.lastError)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "a successfully-synced row is purged (Minor #4), never left `.done`")
 
         let workLogs = try context.fetch(FetchDescriptor<WorkLog>())
         XCTAssertEqual(workLogs.count, 1, "reconcile must update in place, never duplicate")
@@ -236,8 +250,7 @@ final class OutboxWorkerTests: XCTestCase {
         XCTAssertEqual(gateway.callOrder, ["checkIn:\(workLogClientUuid)", "checkOut:\(workLogClientUuid)"], "must replay oldest-first")
 
         let items = try context.fetch(FetchDescriptor<SyncOutbox>())
-        XCTAssertEqual(items.count, 2)
-        XCTAssertTrue(items.allSatisfy { $0.state == OutboxState.done.rawValue })
+        XCTAssertTrue(items.isEmpty, "both rows succeed and are purged (Minor #4), never retained as `.done`")
 
         let workLogs = try context.fetch(FetchDescriptor<WorkLog>())
         XCTAssertEqual(workLogs.count, 1, "both reconciles target the same row, never duplicating")
@@ -353,7 +366,7 @@ final class OutboxWorkerTests: XCTestCase {
         await worker.drain()
 
         XCTAssertEqual(gateway.checkInCalls.count, 1)
-        XCTAssertEqual(item.state, OutboxState.done.rawValue)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "succeeded — purged (Minor #4), not left `.done`")
     }
 
     // MARK: - pendingCount / conflictCount
@@ -392,6 +405,238 @@ final class OutboxWorkerTests: XCTestCase {
         XCTAssertNotNil(bogus.lastError)
         // A permanent failure never stops the pass — the second, valid row still gets processed.
         XCTAssertEqual(gateway.checkInCalls.count, 1)
+    }
+
+    // MARK: - drain(): dependent check-out defers when its check-in fails transiently (m4a-review Important #2)
+
+    /// If check-in returns a transient failure (429/5xx, doesn't stop the pass) and stays
+    /// `.pending`, the dependent check-out for the *same* work-log must never be attempted this
+    /// pass — replaying it against a work-log the server hasn't created yet would 404 into a
+    /// `.conflict` the check-in's later success can never un-stick (the exact bug m4a-review
+    /// Important #2 describes). Both rows then succeed together on the very next `drain()` call.
+    func testDependentCheckOutDefersWhenCheckInFailsTransientlyThenBothSucceedNextPass() async throws {
+        let context = try makeContext()
+        let workLogClientUuid = UUID().uuidString
+        insertCheckInItem(context: context, workLogClientUuid: workLogClientUuid, createdAt: Date(timeIntervalSince1970: 100))
+        insertCheckOutItem(context: context, workLogClientUuid: workLogClientUuid, quantity: 5, notes: "done", createdAt: Date(timeIntervalSince1970: 200))
+        try context.save()
+
+        let gateway = FakeWorkLogGateway()
+        gateway.checkInResult = .failure(ApiError.server(status: 429))
+        let worker = OutboxWorker(gateway: gateway, modelContext: context)
+
+        await worker.drain()
+
+        XCTAssertEqual(gateway.checkInCalls.count, 1)
+        XCTAssertTrue(gateway.checkOutCalls.isEmpty, "the dependent check-out must be deferred, never attempted against a not-yet-created work log")
+
+        let itemsAfterFirstPass = try context.fetch(FetchDescriptor<SyncOutbox>())
+        XCTAssertEqual(itemsAfterFirstPass.count, 2, "both rows are still queued — nothing was wrongly conflicted")
+        let checkInRow = try XCTUnwrap(itemsAfterFirstPass.first { $0.endpoint == OutboxEndpoint.checkIn.rawValue })
+        let checkOutRow = try XCTUnwrap(itemsAfterFirstPass.first { $0.endpoint == OutboxEndpoint.checkOut.rawValue })
+        XCTAssertEqual(checkInRow.state, OutboxState.pending.rawValue)
+        XCTAssertEqual(checkInRow.attempts, 1)
+        XCTAssertEqual(checkOutRow.state, OutboxState.pending.rawValue, "deferred, never conflicted")
+        XCTAssertEqual(checkOutRow.attempts, 0, "never even attempted")
+
+        // Next pass: check-in now succeeds, unblocking the check-out within the same later call.
+        gateway.checkInResult = .success(dto(id: "server-1", status: "CHECKED_IN", clientUuid: workLogClientUuid))
+        gateway.checkOutResult = .success(dto(
+            id: "server-1", checkOutAt: Date(timeIntervalSince1970: 2_000), quantity: 5, notes: "done",
+            status: "CHECKED_OUT", updatedAt: Date(timeIntervalSince1970: 2_000), clientUuid: workLogClientUuid
+        ))
+        await worker.drain()
+
+        XCTAssertEqual(gateway.checkInCalls.count, 2)
+        XCTAssertEqual(gateway.checkOutCalls.count, 1)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "both rows now succeed and are purged")
+
+        let workLog = try XCTUnwrap(try context.fetch(FetchDescriptor<WorkLog>()).first)
+        XCTAssertEqual(workLog.status, "CHECKED_OUT")
+    }
+
+    // MARK: - reconcile(): guards against clobbering an optimistic CHECKED_OUT row (m4a-review Minor #3)
+
+    /// A check-in replay's response DTO is always still CHECKED_IN — the server hasn't
+    /// processed the queued check-out yet, or this call wouldn't be happening. Applying it
+    /// unconditionally would revert an already-optimistic CHECKED_OUT local row back to
+    /// CHECKED_IN whenever the check-out hasn't *also* landed in the same pass (here: it fails
+    /// with a network error right after, stopping the pass before its own reconcile can
+    /// re-establish CHECKED_OUT) — the exact repro from the finding.
+    func testCheckInReconcileDoesNotClobberOptimisticCheckedOutRowWhileCheckOutStillQueued() async throws {
+        let context = try makeContext()
+        let workLogClientUuid = UUID().uuidString
+        // Mirrors WorkLogActions.checkIn() then .checkOut() on the same row while offline: both
+        // optimistic mutations already applied before either outbox row has synced.
+        context.insert(WorkLog(
+            id: workLogClientUuid, clientUuid: workLogClientUuid, jobId: "job-1", workTypeId: "wt-1",
+            status: "CHECKED_OUT", checkInAt: Date(timeIntervalSince1970: 1_000),
+            checkOutAt: Date(timeIntervalSince1970: 1_500), quantity: 9.5, notes: "done",
+            updatedAt: Date(timeIntervalSince1970: 1_500)
+        ))
+        insertCheckInItem(context: context, workLogClientUuid: workLogClientUuid, createdAt: Date(timeIntervalSince1970: 500))
+        insertCheckOutItem(context: context, workLogClientUuid: workLogClientUuid, quantity: 9.5, notes: "done", createdAt: Date(timeIntervalSince1970: 600))
+        try context.save()
+
+        let gateway = FakeWorkLogGateway()
+        gateway.checkInResult = .success(dto(
+            id: "server-1", status: "CHECKED_IN", updatedAt: Date(timeIntervalSince1970: 1_100), clientUuid: workLogClientUuid
+        ))
+        struct Offline: Error {}
+        gateway.checkOutResult = .failure(ApiError.network(Offline()))
+        let worker = OutboxWorker(gateway: gateway, modelContext: context)
+
+        await worker.drain()
+
+        XCTAssertEqual(gateway.checkInCalls.count, 1)
+        XCTAssertEqual(gateway.checkOutCalls.count, 1, "check-out must still be attempted right after check-in succeeds")
+
+        let workLogs = try context.fetch(FetchDescriptor<WorkLog>())
+        XCTAssertEqual(workLogs.count, 1)
+        XCTAssertEqual(
+            workLogs.first?.status, "CHECKED_OUT",
+            "the check-in replay's stale CHECKED_IN DTO must not clobber the optimistic CHECKED_OUT row while its check-out is still queued"
+        )
+
+        let remaining = try context.fetch(FetchDescriptor<SyncOutbox>())
+        XCTAssertEqual(remaining.count, 1, "the check-in row succeeded and was purged")
+        XCTAssertEqual(remaining.first?.endpoint, OutboxEndpoint.checkOut.rawValue)
+        XCTAssertEqual(remaining.first?.state, OutboxState.pending.rawValue)
+    }
+
+    // MARK: - drain(): purges succeeded rows instead of retaining `.done` (m4a-review Minor #4)
+
+    /// Nothing ever reads a `.done` `SyncOutbox` row again — leaving it around just grows the
+    /// table unbounded across the app's life. A successful replay must delete its row.
+    func testDrainDeletesOutboxRowsOnSuccessInsteadOfRetainingThemAsDone() async throws {
+        let context = try makeContext()
+        let firstUuid = UUID().uuidString
+        let secondUuid = UUID().uuidString
+        insertCheckInItem(context: context, workLogClientUuid: firstUuid, createdAt: Date(timeIntervalSince1970: 100))
+        insertCheckOutItem(context: context, workLogClientUuid: secondUuid, createdAt: Date(timeIntervalSince1970: 200))
+        try context.save()
+
+        let gateway = FakeWorkLogGateway()
+        gateway.checkInResult = .success(dto(id: "server-1", status: "CHECKED_IN", clientUuid: firstUuid))
+        gateway.checkOutResult = .success(dto(id: "server-2", status: "CHECKED_OUT", clientUuid: secondUuid))
+        let worker = OutboxWorker(gateway: gateway, modelContext: context)
+
+        await worker.drain()
+
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "a successfully-synced row must be purged, never retained as `.done`")
+    }
+
+    // MARK: - drain(): re-fetches until stable, picking up rows enqueued mid-pass (m4a-review Minor #5)
+
+    /// A row that lands on the shared context *while* a pass is mid-request (its own
+    /// fire-and-forget `Task { drain() }` no-ops on the re-entrancy guard) must still be picked
+    /// up by this same `drain()` call, not stranded until the next external trigger.
+    func testDrainPicksUpARowEnqueuedMidPassWithoutNeedingAnExternalTrigger() async throws {
+        let context = try makeContext()
+        let firstUuid = UUID().uuidString
+        insertCheckInItem(context: context, workLogClientUuid: firstUuid, createdAt: Date(timeIntervalSince1970: 100))
+        try context.save()
+
+        let gateway = FakeWorkLogGateway()
+        gateway.checkInResult = .success(dto(id: "server-1", status: "CHECKED_IN", clientUuid: firstUuid))
+        let worker = OutboxWorker(gateway: gateway, modelContext: context)
+
+        let secondUuid = UUID().uuidString
+        var didEnqueueSecond = false
+        gateway.onCheckIn = { [weak context] in
+            // Simulate a second check-in landing on the same context while the first item's
+            // own request is conceptually still in flight — mirrors `WorkLogActions.enqueue`'s
+            // direct insert onto the shared `ModelContext`.
+            guard !didEnqueueSecond, let context else { return }
+            didEnqueueSecond = true
+            let payload = CheckInPayload(jobId: "job-2", workTypeId: nil, notes: nil, clientUuid: secondUuid)
+            context.insert(SyncOutbox(
+                clientUuid: UUID().uuidString, endpoint: OutboxEndpoint.checkIn.rawValue,
+                payload: try! JSONEncoder().encode(payload), createdAt: Date(timeIntervalSince1970: 999)
+            ))
+            try? context.save()
+        }
+
+        await worker.drain()
+
+        XCTAssertEqual(gateway.checkInCalls.count, 2, "the mid-pass row must be picked up by this same drain() call")
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "both rows succeed and are purged")
+    }
+
+    // MARK: - isHeld (C2)
+
+    /// An external pause switch (set by a UI-test hook, per the pinned contract) makes `drain()`
+    /// a complete no-op — nothing is fetched, nothing is attempted.
+    func testDrainNoOpsWhenIsHeld() async throws {
+        let context = try makeContext()
+        insertCheckInItem(context: context, workLogClientUuid: UUID().uuidString, createdAt: Date(timeIntervalSince1970: 100))
+        try context.save()
+
+        let gateway = FakeWorkLogGateway()
+        gateway.checkInResult = .success(dto(id: "server-1", status: "CHECKED_IN"))
+        let worker = OutboxWorker(gateway: gateway, modelContext: context)
+        worker.isHeld = true
+
+        await worker.drain()
+
+        XCTAssertTrue(gateway.checkInCalls.isEmpty, "isHeld must make drain() a complete no-op")
+        XCTAssertEqual(worker.pendingCount, 1)
+        XCTAssertFalse(worker.isDraining)
+    }
+
+    // MARK: - drain(): cooperative cancellation (ios-units-review Important / C4)
+
+    /// `Task.isCancelled` is checked between items: an already-in-flight request is allowed to
+    /// finish, but a not-yet-started one must never begin once cancelled.
+    func testDrainStopsAtTheNextItemBoundaryWhenTaskIsCancelled() async throws {
+        let context = try makeContext()
+        let firstUuid = UUID().uuidString
+        let secondUuid = UUID().uuidString
+        insertCheckInItem(context: context, workLogClientUuid: firstUuid, createdAt: Date(timeIntervalSince1970: 100))
+        let second = insertCheckInItem(context: context, workLogClientUuid: secondUuid, createdAt: Date(timeIntervalSince1970: 200))
+        try context.save()
+
+        let gateway = FakeWorkLogGateway()
+        gateway.checkInDelayNanoseconds = 150_000_000
+        gateway.checkInResult = .success(dto(id: "server-1", status: "CHECKED_IN", clientUuid: firstUuid))
+        let worker = OutboxWorker(gateway: gateway, modelContext: context)
+
+        let task = Task { await worker.drain() }
+        try await Task.sleep(nanoseconds: 20_000_000) // well inside the 150ms delay: the first item is in flight
+        task.cancel()
+        await task.value
+
+        XCTAssertEqual(gateway.checkInCalls.count, 1, "the already-in-flight first item finishes, but the second must never start once cancelled")
+        XCTAssertEqual(second.state, OutboxState.pending.rawValue)
+        XCTAssertEqual(second.attempts, 0)
+        XCTAssertFalse(worker.isDraining)
+    }
+
+    // MARK: - pendingCount / conflictCount are @Observable-tracked, stored properties (ios-units-review Minor / C3)
+
+    /// The old `pendingCount`/`conflictCount` were computed properties reading `modelContext
+    /// .fetchCount` directly — SwiftUI's `@Observable` machinery only tracks *reads of stored
+    /// properties* during `withObservationTracking`'s closure, so a computed property backed by
+    /// an external fetch registers no dependency at all and `onChange` would never fire
+    /// (ios-units-review: `SettingsSheet` never refreshed while open). Now a stored property
+    /// reassigned by `refreshCounts()`, reading it inside `withObservationTracking` must
+    /// register a trackable dependency that fires when it's reassigned.
+    func testPendingCountMutationIsObservationTrackable() async throws {
+        let context = try makeContext()
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+
+        let changed = expectation(description: "pendingCount mutation observed")
+        withObservationTracking {
+            _ = worker.pendingCount
+        } onChange: {
+            changed.fulfill()
+        }
+
+        insertCheckInItem(context: context, workLogClientUuid: UUID().uuidString, createdAt: Date())
+        try context.save()
+        worker.refreshCounts()
+
+        await fulfillment(of: [changed], timeout: 1.0)
     }
 }
 

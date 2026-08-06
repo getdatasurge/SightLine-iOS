@@ -38,7 +38,7 @@ final class WorkLogActionsTests: XCTestCase {
         let gateway = StubWorkLogGateway()
         let actions = WorkLogActions(gateway: gateway, modelContext: context)
 
-        let result = actions.checkIn(jobId: "job-1", workTypeId: "wt-1", notes: "started")
+        let result = actions.checkIn(jobId: "job-1", workTypeId: "wt-1", notes: "started", technicianId: "tech-1")
 
         // A real, freshly-minted UUID — not empty, not server-sourced garbage.
         XCTAssertNotNil(UUID(uuidString: result.clientUuid))
@@ -47,7 +47,7 @@ final class WorkLogActionsTests: XCTestCase {
         XCTAssertEqual(result.jobId, "job-1")
         XCTAssertEqual(result.workTypeId, "wt-1")
         XCTAssertEqual(result.notes, "started")
-        XCTAssertNil(result.technicianId, "unknown locally until the outbox reconciles the server's row")
+        XCTAssertEqual(result.technicianId, "tech-1", "must land on the optimistic row immediately (m4a-review Important #1) — not wait for the outbox to reconcile the server's row")
 
         let workLogs = try context.fetch(FetchDescriptor<WorkLog>())
         XCTAssertEqual(workLogs.count, 1)
@@ -76,8 +76,8 @@ final class WorkLogActionsTests: XCTestCase {
         let context = try makeContext()
         let actions = WorkLogActions(gateway: StubWorkLogGateway(), modelContext: context)
 
-        let first = actions.checkIn(jobId: "job-1", workTypeId: nil, notes: nil)
-        let second = actions.checkIn(jobId: "job-1", workTypeId: nil, notes: nil)
+        let first = actions.checkIn(jobId: "job-1", workTypeId: nil, notes: nil, technicianId: nil)
+        let second = actions.checkIn(jobId: "job-1", workTypeId: nil, notes: nil, technicianId: nil)
 
         XCTAssertNotEqual(first.clientUuid, second.clientUuid)
         XCTAssertEqual(try context.fetchCount(FetchDescriptor<WorkLog>()), 2)
@@ -177,6 +177,24 @@ final class WorkLogActionsTests: XCTestCase {
         XCTAssertEqual(actions.openWorkLog(onJob: "job-1", technicianId: "tech-1")?.id, "mine")
         XCTAssertNil(actions.openWorkLog(onJob: "job-1", technicianId: "tech-3"))
         XCTAssertEqual(actions.openWorkLog(onJob: "job-1", technicianId: nil)?.id, "legacy")
+    }
+
+    /// The exact m4a-review Important #1 repro: offline, `checkIn` must write a row
+    /// `openWorkLog(onJob:technicianId:)` can immediately see — otherwise the Check In → Check
+    /// Out toggle never flips (the view keeps showing "Check In"), and a second tap mints a
+    /// *second* clientUuid/WorkLog/outbox row, creating a duplicate open session once the
+    /// outbox drains.
+    func testCheckInRowIsImmediatelyVisibleToOpenWorkLogForTheSameTechnician() throws {
+        let context = try makeContext()
+        let actions = WorkLogActions(gateway: StubWorkLogGateway(), modelContext: context)
+
+        let checkedIn = actions.checkIn(jobId: "job-1", workTypeId: "wt-1", notes: nil, technicianId: "tech-1")
+
+        let open = actions.openWorkLog(onJob: "job-1", technicianId: "tech-1")
+        XCTAssertEqual(open?.id, checkedIn.id, "the just-created offline session must be visible without waiting for the outbox to reconcile")
+
+        // A teammate's technicianId must still not see this caller's own session.
+        XCTAssertNil(actions.openWorkLog(onJob: "job-1", technicianId: "tech-2"))
     }
 
     func testOpenWorkLogPicksMostRecentlyOpenedWhenMultipleMatch() async throws {

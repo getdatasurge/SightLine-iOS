@@ -150,6 +150,30 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertFalse(engine.isSyncing)
     }
 
+    // MARK: - Task.isCancelled between collections (ios-units-review Important / C4)
+
+    /// `Task.isCancelled` is checked at the top of every collection loop iteration: a
+    /// `BackgroundRefresher` expiry must stop `syncAll()` before it starts the *next*
+    /// collection, not run all six to completion regardless. The collection already `await`ing
+    /// when cancellation lands is allowed to finish (matches `OutboxWorker.drain()`'s identical
+    /// "between items" contract).
+    func testSyncAllStopsBeforeTheNextCollectionOnceTaskIsCancelled() async throws {
+        let stub = StubSyncBackend()
+        stub.jobsDelayNanoseconds = 150_000_000 // wide margin over the 20ms cancel below
+        let engine = SyncEngine(backend: stub, modelContext: try makeContext(), watermarks: SyncWatermarks(defaults: freshDefaults()))
+
+        let task = Task { await engine.syncAll() }
+        try await Task.sleep(nanoseconds: 20_000_000) // well inside the 150ms delay: .jobs is in flight
+        task.cancel()
+        await task.value
+
+        XCTAssertEqual(stub.jobsSinceCalls.count, 1, "jobs had already started before cancellation landed")
+        XCTAssertTrue(stub.appointmentsSinceCalls.isEmpty, "must not start the next collection once cancelled")
+        XCTAssertTrue(stub.workTypesSinceCalls.isEmpty)
+        XCTAssertTrue(stub.workLogsSinceCalls.isEmpty)
+        XCTAssertFalse(engine.isSyncing)
+    }
+
     func testWatermarkNotAdvancedOnFailedCollection() async throws {
         let stub = StubSyncBackend()
         stub.workLogsResult = .failure(ApiError.network(URLError(.notConnectedToInternet)))

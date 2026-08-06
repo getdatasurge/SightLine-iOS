@@ -93,6 +93,47 @@ final class BackgroundRefresherTests: XCTestCase {
         XCTAssertNotNil(syncEngine.lastSyncedAt, "the sync half must still run after an outbox conflict")
     }
 
+    // MARK: - performRefresh(): cooperative cancellation (ios-units-review Important / C4)
+
+    /// `outboxWorker.drain()` and `syncEngine.syncAll()` each check `Task.isCancelled`
+    /// internally, and `performRefresh()` adds one more checkpoint between the two halves — a
+    /// cancellation landing while the outbox item is in flight lets that one request finish
+    /// (matches `OutboxWorker`'s own "between items" contract) but must skip the sync half
+    /// entirely rather than always paying for a full six-collection pass regardless.
+    func testPerformRefreshSkipsSyncEngineWhenCancelledDuringDrain() async throws {
+        let context = try makeContext()
+        let workLogClientUuid = UUID().uuidString
+        context.insert(WorkLog(
+            id: workLogClientUuid, clientUuid: workLogClientUuid, jobId: "job-1", workTypeId: "wt-1",
+            status: "CHECKED_IN", checkInAt: Date(timeIntervalSince1970: 1_000), updatedAt: Date(timeIntervalSince1970: 1_000)
+        ))
+        let payload = CheckInPayload(jobId: "job-1", workTypeId: "wt-1", notes: nil, clientUuid: workLogClientUuid)
+        context.insert(SyncOutbox(
+            clientUuid: UUID().uuidString, endpoint: OutboxEndpoint.checkIn.rawValue,
+            payload: try! JSONEncoder().encode(payload), attempts: 0, state: OutboxState.pending.rawValue,
+            createdAt: Date(timeIntervalSince1970: 500)
+        ))
+        try context.save()
+
+        let gateway = FakeWorkLogGateway()
+        gateway.checkInDelayNanoseconds = 150_000_000
+        gateway.checkInResult = .success(checkInDTO(id: "server-1", clientUuid: workLogClientUuid))
+        let outboxWorker = OutboxWorker(gateway: gateway, modelContext: context)
+
+        let stub = StubSyncBackend()
+        let syncEngine = SyncEngine(backend: stub, modelContext: context, watermarks: SyncWatermarks(defaults: freshDefaults()))
+        let refresher = BackgroundRefresher(outboxWorker: outboxWorker, syncEngine: syncEngine)
+
+        let task = Task { await refresher.performRefresh() }
+        try await Task.sleep(nanoseconds: 20_000_000) // well inside the 150ms delay: the one pending item is in flight
+        task.cancel()
+        await task.value
+
+        XCTAssertEqual(gateway.checkInCalls.count, 1, "the already-in-flight outbox item still finishes")
+        XCTAssertNil(syncEngine.lastSyncedAt, "a cancelled performRefresh must skip the sync half entirely")
+        XCTAssertTrue(stub.jobsSinceCalls.isEmpty)
+    }
+
     // MARK: - scheduleNext(): must never throw
 
     /// `BGTaskScheduler.submit` throws in this test environment (the identifier was never

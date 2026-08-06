@@ -9,7 +9,7 @@ import Observation
 @MainActor
 @Observable
 final class Connectivity {
-    private(set) var isOnline: Bool
+    private(set) var isOnline = false
 
     /// Fired exactly on the offline→online edge — not on every "still online" update, and not on
     /// the initial path report even when it happens to already be satisfied (that's a starting
@@ -20,12 +20,17 @@ final class Connectivity {
     private let monitor = NWPathMonitor()
     private let queue = DispatchQueue(label: "com.getdatasurge.sightline.field.connectivity")
 
-    init() {
-        // `currentPath` reflects the monitor's best-known state synchronously, so `isOnline`
-        // starts accurate immediately rather than defaulting optimistically/pessimistically and
-        // waiting for the first background callback to correct it.
-        isOnline = monitor.currentPath.status == .satisfied
+    /// Whether `handle(satisfied:)` has processed at least one real path update from the
+    /// monitor yet. `NWPathMonitor.currentPath` isn't reliably populated before `start()`
+    /// (ios-units-review Minor) — reading it synchronously in `init` could seed `isOnline`
+    /// `false` while the device is actually online, making `start()`'s very first callback look
+    /// like a genuine offline→online edge and firing `onBecameOnline()` on startup. `isOnline`
+    /// now starts at its plain default instead, and this flag — not a `currentPath` pre-read —
+    /// decides whether the first callback is a *starting state* (seed `isOnline`, no fire,
+    /// whichever way it comes in) or a genuine *transition* (the normal edge-detection below).
+    private var hasReceivedFirstUpdate = false
 
+    init() {
         monitor.pathUpdateHandler = { [weak self] path in
             let satisfied = path.status == .satisfied
             Task { @MainActor [weak self] in
@@ -39,7 +44,16 @@ final class Connectivity {
         monitor.cancel()
     }
 
-    private func handle(satisfied: Bool) {
+    /// Not `private`: `NWPathMonitor` has no injectable seam (there's nothing to fake to drive
+    /// it deterministically in a test), so this is exposed directly for unit-testing the
+    /// edge-detection state machine itself, the same way `BackgroundRefresher.performRefresh()`
+    /// is exposed because `BGAppRefreshTask` has no public initializer either.
+    func handle(satisfied: Bool) {
+        guard hasReceivedFirstUpdate else {
+            hasReceivedFirstUpdate = true
+            isOnline = satisfied
+            return
+        }
         let wasOnline = isOnline
         isOnline = satisfied
         if satisfied, !wasOnline {

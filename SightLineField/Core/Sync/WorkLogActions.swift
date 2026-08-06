@@ -166,12 +166,14 @@ final class WorkLogActions {
     /// Check In ↔ Check Out state split in `JobDetailView`/`WorkLogsView`.
     ///
     /// Scoped to the caller's `technicianId` when known: `WorkLog.technicianId` is persisted by
-    /// `SyncEngine.syncWorkLogs` and by the outbox's own reconcile step, so a teammate's open
-    /// session on a shared job never flips this caller's UI into "Check Out". Rows synced before
-    /// the column existed, or not yet reconciled from an optimistic check-in, carry `nil` and are
-    /// excluded from the scoped query — acceptable: they predate (or haven't confirmed) the
-    /// caller's session on that job. With `technicianId == nil` (account has no Technician row)
-    /// falls back to job-wide, mirroring the business-wide sync stance.
+    /// `SyncEngine.syncWorkLogs`, the outbox's own reconcile step, and — as of the m4a-review
+    /// Important #1 fix — `checkIn`'s own optimistic write, so a teammate's open session on a
+    /// shared job never flips this caller's UI into "Check Out", and this caller's own
+    /// just-created offline session is visible immediately instead of only after the outbox
+    /// reconciles. Rows synced before the column existed still carry `nil` and are excluded
+    /// from the scoped query — acceptable: they predate the caller's session on that job. With
+    /// `technicianId == nil` (account has no Technician row) falls back to job-wide, mirroring
+    /// the business-wide sync stance.
     func openWorkLog(onJob jobId: String, technicianId: String?) -> WorkLog? {
         let predicate: Predicate<WorkLog>
         if let technicianId {
@@ -188,14 +190,23 @@ final class WorkLogActions {
     /// from this instant on, doubling as the local row's `id` forever (reconciled from the
     /// server's response, but never remapped to the server's own row id) — writes the row
     /// already `CHECKED_IN`, and enqueues the real check-in call.
+    ///
+    /// `technicianId` is the caller's own — never sent to the server itself (the wire body has
+    /// no such field; `LiveWorkLogGateway`'s doc comment explains why) — but must land on this
+    /// optimistic row anyway: `openWorkLog(onJob:technicianId:)` scopes its query by it, so a
+    /// row missing it is invisible to that query until the outbox reconciles the server's
+    /// response. Without this (m4a-review Important #1), the Check In → Check Out toggle never
+    /// flips offline, and a second tap mints a *second* clientUuid/WorkLog/outbox row — a
+    /// duplicate open session server-side once the outbox drains.
     @discardableResult
-    func checkIn(jobId: String, workTypeId: String?, notes: String?) -> WorkLog {
+    func checkIn(jobId: String, workTypeId: String?, notes: String?, technicianId: String?) -> WorkLog {
         let clientUuid = UUID().uuidString
         let now = Date()
         let model = WorkLog(
             id: clientUuid,
             clientUuid: clientUuid,
             jobId: jobId,
+            technicianId: technicianId,
             workTypeId: workTypeId,
             status: "CHECKED_IN",
             checkInAt: now,
@@ -235,12 +246,17 @@ final class WorkLogActions {
     /// as whatever optimistic `WorkLog` mutation `checkIn`/`checkOut` just made above (SwiftData
     /// saves every pending change on the context, not just the object touched last), then kicks
     /// off a drain without waiting for it — the fire-and-forget half of "optimistic + enqueue".
+    /// `outboxWorker.refreshCounts()` runs right after the save: this row lands directly on the
+    /// shared `modelContext` rather than through `OutboxWorker`, so nothing else would otherwise
+    /// tell its `@Observable` `pendingCount` about it before the fire-and-forget drain gets
+    /// around to running.
     private func enqueue<Payload: Encodable>(_ endpoint: OutboxEndpoint, _ payload: Payload) {
         // `CheckInPayload`/`CheckOutPayload` are plain strings/doubles/optionals — nothing about
         // encoding them can fail, so this never actually traps.
         let data = try! JSONEncoder().encode(payload)
         modelContext.insert(SyncOutbox(clientUuid: UUID().uuidString, endpoint: endpoint.rawValue, payload: data))
         try? modelContext.save()
+        outboxWorker.refreshCounts()
         Task { await outboxWorker.drain() }
     }
 }

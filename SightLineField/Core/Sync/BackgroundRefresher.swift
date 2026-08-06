@@ -71,8 +71,18 @@ final class BackgroundRefresher {
     /// `BGAppRefreshTask` has no public initializer, so a unit test can't construct one to drive
     /// `handle(_:)` end-to-end. Oldest-first outbox replay first (so a subsequent sync pull sees
     /// this device's own just-uploaded writes reflected back), then a full collection sync.
+    ///
+    /// Cooperatively cancellable (ios-units-review Important): `outboxWorker.drain()` and
+    /// `syncEngine.syncAll()` each check `Task.isCancelled` internally (between outbox items and
+    /// between sync collections respectively — see their own doc comments), and this adds one
+    /// more checkpoint between the two halves, so an expiry that lands right as the drain
+    /// finishes skips the sync half entirely rather than always paying for a full pass. Together
+    /// these mean `handle(_:)`'s `task.expirationHandler` cancellation actually stops the work
+    /// promptly instead of merely flagging `work.isCancelled` while everything runs to
+    /// completion regardless.
     func performRefresh() async {
         await outboxWorker.drain()
+        guard !Task.isCancelled else { return }
         await syncEngine.syncAll()
     }
 }
