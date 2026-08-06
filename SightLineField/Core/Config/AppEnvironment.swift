@@ -9,7 +9,7 @@ struct AppEnvironment: Sendable {
         #if DEBUG
         URL(string: "http://localhost:3005")!
         #else
-        URL(string: "https://staging-placeholder.sightline.invalid")! // TBD host is intentional: Release target unset until staging exists (spec: non-blocking)
+        URL(string: "https://staging-sightline-app.everestllm.com")! // Release → SightLine staging origin (client appends /api/v1)
         #endif
     }
 
