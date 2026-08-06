@@ -120,7 +120,11 @@ struct ElevationDTO: Decodable, Equatable, Sendable {
     let buildingId: String
     let elevationNumber: Int
     let numberLabel: String?
-    let label: String
+    /// Optional: the backend returns `"label": null` for an elevation the estimator never named
+    /// (only `elevationNumber`/`numberLabel` identify it). A non-optional `String` here made the
+    /// whole `buildings` collection fail to decode — one unlabeled elevation killed sync for
+    /// every job's buildings.
+    let label: String?
     let bearing: Int?
     let facing: String?
     let fieldAdded: Bool
@@ -143,7 +147,10 @@ struct ElevationDTO: Decodable, Equatable, Sendable {
 /// `LiveSyncBackend.fetchBuildings` already knows the id of the job it just called for.
 struct BuildingDTO: Decodable, Equatable, Sendable {
     let id: String
-    let name: String
+    /// Optional: the backend returns `name: null` for an unnamed building (only `buildingIndex`
+    /// identifies it). A non-optional `String` here made the whole `buildings` collection fail
+    /// to decode — one unnamed building killed sync for every job's buildings.
+    let name: String?
     let buildingIndex: Int
     let notes: String?
     let updatedAt: Date

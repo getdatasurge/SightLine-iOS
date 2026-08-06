@@ -55,7 +55,7 @@ struct AssignSurfaceSheet: View {
                             LabeledContent("Pane", value: surface.label)
                         }
                         ForEach(buildings) { building in
-                            Section(building.name) {
+                            Section(building.displayName) {
                                 BuildingElevationOptions(elevations: elevationsByBuilding[building.id] ?? [], selection: $selection)
                             }
                         }
@@ -136,7 +136,12 @@ private struct BuildingElevationOptions: View {
     /// convention `JobElevationsView.ElevationRow.headline` uses for its own rows, so an
     /// elevation reads identically here and on the Elevations tab.
     private func headline(for elevation: Elevation) -> String {
-        guard let numberLabel = elevation.numberLabel, !numberLabel.isEmpty else { return elevation.label }
-        return "\(numberLabel) · \(elevation.label)"
+        let number = (elevation.numberLabel?.isEmpty == false) ? elevation.numberLabel : nil
+        switch (number, elevation.label) {
+        case let (num?, label?): return "\(num) · \(label)"
+        case let (num?, nil):    return num
+        case let (nil, label?):  return label
+        case (nil, nil):         return "Elevation \(elevation.elevationNumber)"
+        }
     }
 }

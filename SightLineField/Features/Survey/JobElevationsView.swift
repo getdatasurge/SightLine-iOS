@@ -47,7 +47,7 @@ struct JobElevationsView: View {
             } else {
                 List {
                     ForEach(buildings) { building in
-                        Section(building.name) {
+                        Section(building.displayName) {
                             BuildingElevationRows(elevations: elevationsByBuilding[building.id] ?? []) { elevation in
                                 captureTarget = elevation
                             }
@@ -97,10 +97,16 @@ private struct ElevationRow: View {
     let onCapture: (Elevation) -> Void
 
     /// `numberLabel` (short field code, e.g. "1") prefixed onto `label` (the descriptive name)
-    /// when present; `label` alone otherwise — `label` is always there, `numberLabel` isn't.
+    /// when both are present; either alone otherwise; and `"Elevation N"` when the estimator
+    /// left both empty (an unnamed, unnumbered planned elevation).
     private var headline: String {
-        guard let numberLabel = elevation.numberLabel, !numberLabel.isEmpty else { return elevation.label }
-        return "\(numberLabel) · \(elevation.label)"
+        let number = (elevation.numberLabel?.isEmpty == false) ? elevation.numberLabel : nil
+        switch (number, elevation.label) {
+        case let (num?, label?): return "\(num) · \(label)"
+        case let (num?, nil):    return num
+        case let (nil, label?):  return label
+        case (nil, nil):         return "Elevation \(elevation.elevationNumber)"
+        }
     }
 
     var body: some View {

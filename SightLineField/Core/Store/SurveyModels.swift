@@ -19,12 +19,14 @@ import SwiftData
 final class Building {
     @Attribute(.unique) var id: String
     var jobId: String
-    var name: String
+    /// Optional: an estimator may leave a building unnamed (backend sends `name: null`); it's
+    /// then identified only by `buildingIndex`.
+    var name: String?
     var buildingIndex: Int
     var notes: String?
     var updatedAt: Date
 
-    init(id: String, jobId: String, name: String, buildingIndex: Int, notes: String? = nil, updatedAt: Date) {
+    init(id: String, jobId: String, name: String? = nil, buildingIndex: Int, notes: String? = nil, updatedAt: Date) {
         self.id = id
         self.jobId = jobId
         self.name = name
@@ -32,6 +34,9 @@ final class Building {
         self.notes = notes
         self.updatedAt = updatedAt
     }
+
+    /// A never-empty label for UI: the estimator's `name`, or `"Building N"` when unnamed.
+    var displayName: String { name ?? "Building \(buildingIndex)" }
 }
 
 /// One face of a `Building`. `bearing`/`facing` are optional — an elevation can exist before the
@@ -43,7 +48,10 @@ final class Elevation {
     var buildingId: String
     var elevationNumber: Int
     var numberLabel: String?
-    var label: String
+    /// Optional: an estimator-planned elevation may be unnamed (backend sends `label: null`);
+    /// only `elevationNumber`/`numberLabel` identify it then. A field-added row always carries
+    /// the technician's entered label.
+    var label: String?
     var bearing: Int?
     var facing: String?
     var fieldAdded: Bool
@@ -77,7 +85,7 @@ final class Elevation {
         buildingId: String,
         elevationNumber: Int,
         numberLabel: String? = nil,
-        label: String,
+        label: String? = nil,
         bearing: Int? = nil,
         facing: String? = nil,
         fieldAdded: Bool,
