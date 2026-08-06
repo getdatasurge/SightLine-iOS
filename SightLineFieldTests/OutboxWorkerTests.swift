@@ -1370,4 +1370,57 @@ final class SyncEngineSurfaceDedupTests: XCTestCase {
         XCTAssertEqual(surfaces.first?.id, surfaceClientUuid, "fresh insert keys by clientUuid, not the server's row id")
         XCTAssertEqual(surfaces.first?.clientUuid, surfaceClientUuid)
     }
+
+    /// M5c widening: an estimator-synced pane never captured on this device (`syncSurfaces`'s
+    /// `clientUuid == nil` fallback path) previously left `Surface.serverId` `nil` forever —
+    /// only `reconcileSurface` set it. That starved a `.photoUpload(entityType: "surface")`
+    /// dispatch for such a pane: `OutboxWorker.resolveServerId` would defer indefinitely, since
+    /// no `.surfaceCapture` ever runs for a row that was never field-captured. Locks in that
+    /// `syncSurfaces` now stamps `serverId = dto.id` itself (mirrors `syncBuildings`'s
+    /// `Elevation.serverId` stamp), and that a queued surface photo resolves against it on the
+    /// very next drain instead of deferring.
+    func testSyncSurfacesStampsServerIdSoQueuedSurfacePhotoResolvesInsteadOfDeferring() async throws {
+        let stub = StubSyncBackend()
+        let context = try makeContext()
+        // Estimator-created pane, never captured locally: wire clientUuid is nil, so the local
+        // row id falls back to the server's own row id (see `testSyncSurfacesFallsBackTo...`).
+        stub.surfacesResult = .success([
+            SurfaceRecord(jobId: "job-1", surface: SurfaceDTO(
+                id: "server-real-surf-2", label: "Rear Slider", status: "MEASURED", notes: nil,
+                buildingId: nil, elevationId: nil, roomId: nil,
+                updatedAt: Date(timeIntervalSince1970: 1_000), clientUuid: nil
+            ))
+        ])
+        let engine = SyncEngine(backend: stub, modelContext: context, watermarks: SyncWatermarks(defaults: freshDefaults()))
+
+        await engine.syncAll()
+
+        let surfaces = try context.fetch(FetchDescriptor<Surface>())
+        let surface = try XCTUnwrap(surfaces.first)
+        XCTAssertEqual(surface.id, "server-real-surf-2")
+        XCTAssertEqual(surface.serverId, "server-real-surf-2", "syncSurfaces must stamp serverId itself — no reconcileSurface will ever run for this row")
+
+        // A photo queued against this pane (by local id) must resolve — never defer — now that
+        // `serverId` is known.
+        let payload = PhotoUploadPayload(
+            entityType: "surface", entityId: surface.id, filename: "photo.jpg", mimeType: "image/jpeg", imageData: Data([0xFF, 0xD8, 0xFF])
+        )
+        context.insert(SyncOutbox(
+            clientUuid: UUID().uuidString, endpoint: OutboxEndpoint.photoUpload.rawValue,
+            payload: try JSONEncoder().encode(payload), attempts: 0, state: OutboxState.pending.rawValue,
+            createdAt: Date(timeIntervalSince1970: 2_000)
+        ))
+        try context.save()
+
+        let photoGateway = FakePhotoUploadGateway()
+        photoGateway.uploadResult = .success(())
+        let worker = OutboxWorker(gateway: FakeWorkLogGateway(), modelContext: context)
+        worker.photoGateway = photoGateway
+
+        await worker.drain()
+
+        XCTAssertEqual(photoGateway.uploadCalls.count, 1, "must resolve and upload this pass, never defer — RED without the syncSurfaces stamp")
+        XCTAssertEqual(photoGateway.uploadCalls.first?.entityId, "server-real-surf-2")
+        XCTAssertTrue(try context.fetch(FetchDescriptor<SyncOutbox>()).isEmpty, "row purged after success")
+    }
 }

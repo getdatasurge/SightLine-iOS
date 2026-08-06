@@ -300,9 +300,11 @@ final class SyncEngine {
         for plan in plans {
             guard let dto = dtoByKey[plan.record.id] else { continue }
             if let model = existingByKey[plan.record.id] {
-                // `id` left untouched (see the method doc). `serverId` is deliberately NOT set
-                // here — this slice populates it only via `reconcileSurface`; a `syncSurfaces`
-                // widening to also stamp it is a documented future follow-up (`Surface.serverId`).
+                // M5c: every path that learns the server's real surface id persists it — the
+                // source of truth a `.photoUpload(entityType: "surface")` dispatch resolves
+                // `entityId` against (`OutboxWorker.resolveServerId`). Mirrors `syncBuildings`'s
+                // `Elevation.serverId` stamp; uniform for estimator-synced (`serverId == id`)
+                // and field-captured (`serverId != id`, already set by `reconcileSurface`) rows.
                 model.jobId = dto.jobId
                 model.label = dto.surface.label
                 model.status = dto.surface.status
@@ -310,6 +312,7 @@ final class SyncEngine {
                 model.elevationId = dto.surface.elevationId
                 model.roomId = dto.surface.roomId
                 model.clientUuid = dto.surface.clientUuid
+                model.serverId = dto.surface.id
                 model.updatedAt = dto.surface.updatedAt
             } else {
                 modelContext.insert(
@@ -322,6 +325,7 @@ final class SyncEngine {
                         elevationId: dto.surface.elevationId,
                         roomId: dto.surface.roomId,
                         clientUuid: dto.surface.clientUuid,
+                        serverId: dto.surface.id,
                         updatedAt: dto.surface.updatedAt
                     )
                 )

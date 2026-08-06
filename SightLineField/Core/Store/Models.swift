@@ -131,9 +131,9 @@ final class Surface {
     var clientUuid: String?
     /// The server's real primary key for this pane (M5b chain resolver) — the wire `entityId` a
     /// `.photoUpload(entityType: "surface")` dispatch resolves to. Populated by
-    /// `reconcileSurface` after a `.surfaceCapture` replay succeeds; `nil` until then for a
-    /// field-captured pane (and, this slice, for an estimator-synced pane — `syncSurfaces`
-    /// doesn't yet widen to set it, see that method). See `OutboxWorker.resolveServerId`.
+    /// `reconcileSurface` after a `.surfaceCapture` replay succeeds, and (M5c) by `syncSurfaces`
+    /// for a pane never captured on this device — both paths converge on `dto.id`, so an
+    /// estimator-synced pane's photos resolve too.
     var serverId: String?
     var updatedAt: Date
 
