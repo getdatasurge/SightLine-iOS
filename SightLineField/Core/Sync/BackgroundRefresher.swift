@@ -5,11 +5,10 @@ import os
 /// M4c: drains the offline outbox and pulls a fresh sync from a `BGAppRefreshTask` wake, per
 /// `docs/superpowers/specs/2026-08-05-m4-offline-outbox.md` phase C.
 ///
-/// Deliberately registration-free — the App entry point owns
-/// `BGTaskScheduler.shared.register(forTaskWithIdentifier:using:launchHandler:)` (once, at
-/// launch) and wires its launch handler to call `handle(_:)` on an instance built from the same
-/// `OutboxWorker`/`SyncEngine` the rest of the app uses. This class only builds/submits the next
-/// wake request and executes the work once woken.
+/// Registration-free — the App entry point owns the SwiftUI `.backgroundTask(.appRefresh(...))`
+/// scene modifier (keyed off `taskIdentifier`), whose closure calls `performRefresh()` then
+/// `scheduleNext()` on an instance built from the same `OutboxWorker`/`SyncEngine` the rest of
+/// the app uses. This class only builds/submits the next wake request and executes the work.
 @MainActor
 final class BackgroundRefresher {
     /// Must match the `BGTaskSchedulerPermittedIdentifiers` Info.plist entry and whatever
@@ -47,39 +46,15 @@ final class BackgroundRefresher {
         }
     }
 
-    /// The App-entry launch handler's callback for `taskIdentifier`. Reschedules the next wake
-    /// *first* — before doing any work — so a refresh that runs long or gets expired mid-flight
-    /// still leaves a future one queued rather than silently going dark. The actual drain+sync
-    /// runs on its own `Task` so `task.expirationHandler` (fired by iOS if it reclaims the slot
-    /// before the work finishes) can cancel it; `setTaskCompleted(success:)` reports `true` only
-    /// if that never happened.
-    func handle(_ task: BGAppRefreshTask) async {
-        scheduleNext()
-
-        let work = Task {
-            await self.performRefresh()
-        }
-        task.expirationHandler = {
-            work.cancel()
-        }
-
-        await work.value
-        task.setTaskCompleted(success: !work.isCancelled)
-    }
-
-    /// The actual drain-then-sync body, factored out of `handle(_:)` so it's directly testable —
-    /// `BGAppRefreshTask` has no public initializer, so a unit test can't construct one to drive
-    /// `handle(_:)` end-to-end. Oldest-first outbox replay first (so a subsequent sync pull sees
-    /// this device's own just-uploaded writes reflected back), then a full collection sync.
+    /// The actual drain-then-sync body, invoked by the App-entry `.backgroundTask` closure.
+    /// Oldest-first outbox replay first (so a subsequent sync pull sees this device's own
+    /// just-uploaded writes reflected back), then a full collection sync.
     ///
     /// Cooperatively cancellable (ios-units-review Important): `outboxWorker.drain()` and
     /// `syncEngine.syncAll()` each check `Task.isCancelled` internally (between outbox items and
     /// between sync collections respectively — see their own doc comments), and this adds one
-    /// more checkpoint between the two halves, so an expiry that lands right as the drain
-    /// finishes skips the sync half entirely rather than always paying for a full pass. Together
-    /// these mean `handle(_:)`'s `task.expirationHandler` cancellation actually stops the work
-    /// promptly instead of merely flagging `work.isCancelled` while everything runs to
-    /// completion regardless.
+    /// more checkpoint between the two halves, so a cancellation that lands right as the drain
+    /// finishes skips the sync half entirely rather than always paying for a full pass.
     func performRefresh() async {
         await outboxWorker.drain()
         guard !Task.isCancelled else { return }

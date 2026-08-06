@@ -43,6 +43,7 @@ targets:
       path: SightLineField/Info.plist
       properties:
         CFBundleDisplayName: SightLine Field
+        NSFaceIDUsageDescription: SightLine Field uses Face ID to unlock the app after it returns from the background, keeping job and customer data private on a shared installer device.
         UILaunchScreen: {}
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true

@@ -27,7 +27,7 @@ struct CaptureSurfaceSheet: View {
     @State private var glassType = ""
 
     /// Eighth-inch vocabulary per the backend's `FRACTION_LABELS` enum (plan §4).
-    private static let fractionLabels = ["0", "1/8", "1/4", "3/8", "1/2", "5/8", "3/4", "7/8"]
+    private static let fractionLabels = ["none", "1/8", "1/4", "3/8", "1/2", "5/8", "3/4", "7/8"]
 
     private var isCaptureDisabled: Bool {
         label.trimmingCharacters(in: .whitespaces).isEmpty
