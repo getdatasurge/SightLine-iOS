@@ -1,13 +1,15 @@
 import SwiftData
 import SwiftUI
 
-/// Building/elevation hierarchy for one job (M5a). A job's buildings are almost always
+/// Building/elevation hierarchy for one job (M5a/M5b). A job's buildings are almost always
 /// estimator-created on the web before a technician arrives — this view surfaces what
-/// `SyncEngine.syncBuildings()` has pulled down, plus lets a technician add a field-discovered
-/// elevation per building (`AddElevationSheet` → `ElevationActions.addElevation`). Pane→elevation
-/// assignment isn't here: panes are listed in `JobDetailView`'s "Surfaces" section, not this one,
-/// so that's where the assign affordance belongs (deferred — see `SurveyModels.swift`'s file doc
-/// comment).
+/// `SyncEngine.syncBuildings()` has pulled down, lets a technician add a field-discovered
+/// elevation per building (`AddElevationSheet` → `ElevationActions.addElevation`), and lets
+/// them capture a measured pane onto an elevation (`CaptureSurfaceSheet` →
+/// `SurfaceActions.captureSurface`, M5b). Pane assignment/listing beyond capture isn't here:
+/// panes are listed in `JobDetailView`'s "Surfaces" section, not this one, so the
+/// assign-existing-surface affordance belongs there (deferred — see `SurveyModels.swift`'s file
+/// doc comment).
 @MainActor
 struct JobElevationsView: View {
     let jobId: String
@@ -15,6 +17,7 @@ struct JobElevationsView: View {
     @Query private var buildings: [Building]
 
     @State private var addElevationTarget: Building?
+    @State private var captureTarget: Elevation?
 
     /// Mirrors `JobDetailView.init(job:)`: the filter closure captures the plain `jobId`
     /// parameter (not `self.jobId`) so `#Predicate` doesn't need to capture `self`.
@@ -31,7 +34,9 @@ struct JobElevationsView: View {
                 List {
                     ForEach(buildings) { building in
                         Section(building.name) {
-                            BuildingElevationRows(buildingId: building.id)
+                            BuildingElevationRows(buildingId: building.id) { elevation in
+                                captureTarget = elevation
+                            }
                             Button {
                                 addElevationTarget = building
                             } label: {
@@ -47,6 +52,9 @@ struct JobElevationsView: View {
         .sheet(item: $addElevationTarget) { building in
             AddElevationSheet(buildingId: building.id)
         }
+        .sheet(item: $captureTarget) { elevation in
+            CaptureSurfaceSheet(jobId: jobId, buildingId: elevation.buildingId, elevationId: elevation.id)
+        }
     }
 }
 
@@ -54,9 +62,11 @@ struct JobElevationsView: View {
 /// on its own instead of the parent view holding every elevation across every building.
 private struct BuildingElevationRows: View {
     @Query private var elevations: [Elevation]
+    let onCapture: (Elevation) -> Void
 
-    init(buildingId: String) {
+    init(buildingId: String, onCapture: @escaping (Elevation) -> Void) {
         _elevations = Query(filter: #Predicate<Elevation> { $0.buildingId == buildingId }, sort: [SortDescriptor(\.elevationNumber)])
+        self.onCapture = onCapture
     }
 
     var body: some View {
@@ -66,7 +76,7 @@ private struct BuildingElevationRows: View {
                 .foregroundStyle(DS.Color.textSecondary)
         } else {
             ForEach(elevations) { elevation in
-                ElevationRow(elevation: elevation)
+                ElevationRow(elevation: elevation, onCapture: onCapture)
             }
         }
     }
@@ -74,6 +84,7 @@ private struct BuildingElevationRows: View {
 
 private struct ElevationRow: View {
     let elevation: Elevation
+    let onCapture: (Elevation) -> Void
 
     /// `numberLabel` (short field code, e.g. "1") prefixed onto `label` (the descriptive name)
     /// when present; `label` alone otherwise — `label` is always there, `numberLabel` isn't.
@@ -98,6 +109,14 @@ private struct ElevationRow: View {
             if elevation.fieldAdded {
                 FieldAddedBadge()
             }
+            Button {
+                onCapture(elevation)
+            } label: {
+                Label("Capture Pane", systemImage: "plus.viewfinder")
+                    .labelStyle(.iconOnly)
+                    .font(DS.Font.body)
+            }
+            .buttonStyle(.borderless)
         }
     }
 }
