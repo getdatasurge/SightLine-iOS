@@ -8,6 +8,12 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Select Xcode 26.2
+        # The image default is Xcode 16.4, whose iOS 18.5 toolchain/test stack is
+        # incompatible with the image's iOS 26.2 simulators (the first available
+        # iPhone) — unit tests SIGTRAP at random frames under that mismatch.
+        # Pin the Xcode whose SDK/simulator runtime match (26.2).
+        run: sudo xcode-select -s /Applications/Xcode_26.2.app/Contents/Developer
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate project
@@ -22,14 +28,25 @@ jobs:
       - name: Dump simulator crash reports (on failure)
         if: failure()
         run: |
-          shopt -s nullglob
-          echo "=== DiagnosticReports ==="
-          ls -lt ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -15
-          for f in ~/Library/Logs/DiagnosticReports/SightLine*.ips \
-                   ~/Library/Developer/CoreSimulator/Devices/*/data/Library/Logs/CrashReporter/*.ips; do
-            [ -f "$f" ] || continue
-            echo "===== $f ====="
-            head -1 "$f"
-            awk '/^Thread [0-9]+ Crashed/{flag=1;print;next} /^Thread [0-9]+/{flag=0} flag' "$f" | head -80
-          done
-          true
+          python3 - <<'PY'
+          import json, os, glob
+          files = sorted(
+              glob.glob(os.path.expanduser("~/Library/Logs/DiagnosticReports/SightLineField-*.ips")),
+              key=os.path.getmtime,
+          )
+          print(f"found {len(files)} crash reports; dumping 3 most recent")
+          for f in files[-3:]:
+              print("=====", os.path.basename(f))
+              with open(f) as fh:
+                  lines = fh.read().splitlines()
+              body = json.loads(lines[1]) if len(lines) > 1 else json.loads(lines[0])
+              imgs = body.get("usedImages", [])
+              for i, t in enumerate(body.get("threads", [])):
+                  if not t.get("triggered"):
+                      continue
+                  print(f"--- crashed thread {i} name={t.get('name')} queue={t.get('queue')}")
+                  for fr in t.get("frames", [])[:40]:
+                      ii = fr.get("imageIndex", 0)
+                      img = imgs[ii].get("name", "?") if ii < len(imgs) else "?"
+                      print(f"  {img} :: {fr.get('symbol', '?')} +{fr.get('symbolLocation', '?')}")
+          PY
