@@ -5,7 +5,13 @@ on:
     branches: [main]
 jobs:
   build-test:
-    runs-on: macos-15
+    # macos-15's simulator host traps ~2s into every app launch (missing eligibilityd
+    # plist in the sim container - an image/runtime defect, bisected via the .ips
+    # stacks: the SIGTRAP follows load_eligibility_plist and lands on whatever the
+    # main thread is doing). macos-14 ships the known-good pairing this suite is
+    # verified against locally: Xcode 15.4 + iOS 17 sims. Revisit when macos-14 is
+    # EOL (2026-11-02) or the macos-15 sim host is fixed.
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - name: Install XcodeGen
@@ -14,19 +20,10 @@ jobs:
         run: xcodegen generate
       - name: Build and test
         run: |
-          # The image's first-listed iPhone is an iOS 26.2 sim, which SIGTRAPs under
-          # the test host regardless of Xcode (16.4 and 26.2 both crashed). Use the
-          # simulator runtime the selected Xcode actually ships and supports: iOS 18.5
-          # under Xcode 16.4. Select by UDID so the name can't mis-match.
-          SIM_LINE=$(xcrun simctl list devices available | awk '/-- iOS 18/{f=1;next} /^--/{f=0} f && /iPhone/{print; exit}')
-          SIM_ID=$(echo "$SIM_LINE" | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
-          if [ -z "$SIM_ID" ]; then
-            SIM_LINE=$(xcrun simctl list devices available | grep -m1 -E '^\s+iPhone')
-            SIM_ID=$(echo "$SIM_LINE" | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
-          fi
-          echo "Using simulator: $SIM_LINE"
+          SIM_NAME=$(xcrun simctl list devices available | grep -m1 -E '^\s+iPhone' | sed -E 's/^ +//; s/ \(.*//')
+          echo "Using simulator: $SIM_NAME"
           xcodebuild -project SightLineField.xcodeproj -scheme SightLineField \
-            -destination "platform=iOS Simulator,id=$SIM_ID" \
+            -destination "platform=iOS Simulator,name=$SIM_NAME" \
             -skipPackagePluginValidation build test
       - name: Dump simulator crash reports (on failure)
         if: failure()
