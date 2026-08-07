@@ -8,22 +8,25 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Select Xcode 26.2
-        # The image default is Xcode 16.4, whose iOS 18.5 toolchain/test stack is
-        # incompatible with the image's iOS 26.2 simulators (the first available
-        # iPhone) — unit tests SIGTRAP at random frames under that mismatch.
-        # Pin the Xcode whose SDK/simulator runtime match (26.2).
-        run: sudo xcode-select -s /Applications/Xcode_26.2.app/Contents/Developer
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate project
         run: xcodegen generate
       - name: Build and test
         run: |
-          SIM_NAME=$(xcrun simctl list devices available | grep -m1 -E '^\s+iPhone' | sed -E 's/^ +//; s/ \(.*//')
-          echo "Using simulator: $SIM_NAME"
+          # The image's first-listed iPhone is an iOS 26.2 sim, which SIGTRAPs under
+          # the test host regardless of Xcode (16.4 and 26.2 both crashed). Use the
+          # simulator runtime the selected Xcode actually ships and supports: iOS 18.5
+          # under Xcode 16.4. Select by UDID so the name can't mis-match.
+          SIM_LINE=$(xcrun simctl list devices available | awk '/-- iOS 18/{f=1;next} /^--/{f=0} f && /iPhone/{print; exit}')
+          SIM_ID=$(echo "$SIM_LINE" | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
+          if [ -z "$SIM_ID" ]; then
+            SIM_LINE=$(xcrun simctl list devices available | grep -m1 -E '^\s+iPhone')
+            SIM_ID=$(echo "$SIM_LINE" | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
+          fi
+          echo "Using simulator: $SIM_LINE"
           xcodebuild -project SightLineField.xcodeproj -scheme SightLineField \
-            -destination "platform=iOS Simulator,name=$SIM_NAME" \
+            -destination "platform=iOS Simulator,id=$SIM_ID" \
             -skipPackagePluginValidation build test
       - name: Dump simulator crash reports (on failure)
         if: failure()
@@ -37,9 +40,18 @@ jobs:
           print(f"found {len(files)} crash reports; dumping 3 most recent")
           for f in files[-3:]:
               print("=====", os.path.basename(f))
-              with open(f) as fh:
-                  lines = fh.read().splitlines()
-              body = json.loads(lines[1]) if len(lines) > 1 else json.loads(lines[0])
+              raw = fh.read()
+              body = None
+              for candidate in (raw, "\n".join(raw.splitlines()[1:]), raw.splitlines()[1] if len(raw.splitlines()) > 1 else raw):
+                  try:
+                      body = json.loads(candidate)
+                      break
+                  except Exception:
+                      continue
+              if body is None:
+                  print("  (unparseable; first 40 lines:)")
+                  print("\n".join(raw.splitlines()[:40]))
+                  continue
               imgs = body.get("usedImages", [])
               for i, t in enumerate(body.get("threads", [])):
                   if not t.get("triggered"):
