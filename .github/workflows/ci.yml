@@ -39,8 +39,8 @@ jobs:
           )
           print(f"found {len(files)} crash reports; dumping 3 most recent")
           for f in files[-3:]:
-              print("=====", os.path.basename(f))
-              raw = fh.read()
+              with open(f) as fh:
+                  raw = fh.read()
               body = None
               for candidate in (raw, "\n".join(raw.splitlines()[1:]), raw.splitlines()[1] if len(raw.splitlines()) > 1 else raw):
                   try:
