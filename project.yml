@@ -48,6 +48,9 @@ targets:
         UILaunchScreen: {}
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+        # Standard TLS only (no custom crypto) — exempts every build from the App Store
+        # Connect export-compliance question.
+        ITSAppUsesNonExemptEncryption: false
         UIBackgroundModes: [fetch, processing]
         BGTaskSchedulerPermittedIdentifiers: [com.getdatasurge.sightline.field.refresh]
     settings:
