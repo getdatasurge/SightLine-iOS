@@ -2,56 +2,59 @@ import XCTest
 import SwiftData
 @testable import SightLineField
 
-/// Diagnostic (CI-only crash bisect): the unit suite is green on Xcode 15.4 (Swift 5.10) but
-/// SIGTRAPs inside SwiftData on CI (Xcode 16.4, Swift 6) — the `#Predicate` macro expands
-/// differently per compiler and some shape traps at runtime. This suite is named to run FIRST
-/// and prints a PROBE marker before every SwiftData primitive; the last marker in the CI log
-/// before the crash names the exact call + predicate shape that traps, for both store modes.
+/// Diagnostic (CI-only crash bisect): the unit suite is green on Xcode 15.4 / iOS 17 sims but
+/// SIGTRAPs inside SwiftData on CI — the probe's last marker before the trap is `insert` of a
+/// model carrying `@Attribute(.unique)`, on both store modes. This suite runs FIRST and bisects
+/// whether the unique attribute is the trigger: identical model shape with and without
+/// `.unique`, same insert/save/fetch sequence, ephemeral file-backed stores. The last marker
+/// before the CI crash names the culprit.
+@Model
+final class ProbePlain {
+    var id: String
+    var value: String
+    init(id: String, value: String) {
+        self.id = id
+        self.value = value
+    }
+}
+
+@Model
+final class ProbeUnique {
+    @Attribute(.unique) var id: String
+    var value: String
+    init(id: String, value: String) {
+        self.id = id
+        self.value = value
+    }
+}
+
 @MainActor
 final class AAASwiftDataProbeTests: XCTestCase {
-    func testProbeFileBacked() throws { try probe(inMemory: false) }
-    func testProbeInMemory() throws { try probe(inMemory: true) }
-
-    private func probe(inMemory: Bool) throws {
-        let mode = inMemory ? "mem" : "file"
-        print("PROBE[\(mode)]: make container")
-        let context = try StoreContainer.make(inMemory: inMemory).mainContext
-
-        print("PROBE[\(mode)]: insert")
-        context.insert(SyncOutbox(clientUuid: "c1", endpoint: "checkIn", payload: Data()))
-        print("PROBE[\(mode)]: save")
+    func testProbePlainModel() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("probe-plain-\(UUID().uuidString).store")
+        let context = try ModelContainer(
+            for: ProbePlain.self, configurations: ModelConfiguration(url: url)
+        ).mainContext
+        print("PROBE[plain]: insert")
+        context.insert(ProbePlain(id: "p1", value: "v"))
+        print("PROBE[plain]: save")
         try context.save()
+        print("PROBE[plain]: fetch")
+        print("PROBE[plain]: fetched \(try context.fetch(FetchDescriptor<ProbePlain>()).count) done")
+    }
 
-        print("PROBE[\(mode)]: fetch all (no predicate)")
-        let all = try context.fetch(FetchDescriptor<SyncOutbox>())
-        print("PROBE[\(mode)]: fetched \(all.count)")
-
-        print("PROBE[\(mode)]: fetchCount all (no predicate)")
-        print("PROBE[\(mode)]: count \(try context.fetchCount(FetchDescriptor<SyncOutbox>()))")
-
-        let pending = OutboxState.pending.rawValue
-        print("PROBE[\(mode)]: fetchCount single-eq captured local")
-        _ = try context.fetchCount(FetchDescriptor<SyncOutbox>(
-            predicate: #Predicate { $0.state == pending }
-        ))
-
-        let inFlight = OutboxState.inFlight.rawValue
-        print("PROBE[\(mode)]: fetchCount OR two captured locals")
-        _ = try context.fetchCount(FetchDescriptor<SyncOutbox>(
-            predicate: #Predicate { $0.state == pending || $0.state == inFlight }
-        ))
-
-        print("PROBE[\(mode)]: fetch single-eq captured local")
-        _ = try context.fetch(FetchDescriptor<SyncOutbox>(
-            predicate: #Predicate { $0.state == pending }
-        ))
-
-        let jobId = "job-1"
-        print("PROBE[\(mode)]: fetch AND captured local + string literal")
-        _ = try context.fetch(FetchDescriptor<WorkLog>(
-            predicate: #Predicate { $0.jobId == jobId && $0.status == "CHECKED_IN" }
-        ))
-
-        print("PROBE[\(mode)]: done")
+    func testProbeUniqueModel() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("probe-unique-\(UUID().uuidString).store")
+        let context = try ModelContainer(
+            for: ProbeUnique.self, configurations: ModelConfiguration(url: url)
+        ).mainContext
+        print("PROBE[unique]: insert")
+        context.insert(ProbeUnique(id: "u1", value: "v"))
+        print("PROBE[unique]: save")
+        try context.save()
+        print("PROBE[unique]: fetch")
+        print("PROBE[unique]: fetched \(try context.fetch(FetchDescriptor<ProbeUnique>()).count) done")
     }
 }
