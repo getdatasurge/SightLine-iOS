@@ -22,9 +22,14 @@ jobs:
       - name: Dump simulator crash reports (on failure)
         if: failure()
         run: |
-          for f in ~/Library/Logs/DiagnosticLogs/*.ips ~/Library/Logs/DiagnosticLogs/*.crash; do
+          shopt -s nullglob
+          echo "=== DiagnosticReports ==="
+          ls -lt ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -15
+          for f in ~/Library/Logs/DiagnosticReports/SightLine*.ips \
+                   ~/Library/Developer/CoreSimulator/Devices/*/data/Library/Logs/CrashReporter/*.ips; do
             [ -f "$f" ] || continue
             echo "===== $f ====="
-            sed -n '1,80p' "$f"
+            head -1 "$f"
+            awk '/^Thread [0-9]+ Crashed/{flag=1;print;next} /^Thread [0-9]+/{flag=0} flag' "$f" | head -80
           done
           true
