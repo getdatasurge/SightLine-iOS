@@ -29,6 +29,8 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>SightLine Field uses the camera to photograph glass panes and job sites so the photos can be attached to the survey and uploaded when a connection is available.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>SightLine Field uses Face ID to unlock the app after it returns from the background, keeping job and customer data private on a shared installer device.</string>
 	<key>UIBackgroundModes</key>
