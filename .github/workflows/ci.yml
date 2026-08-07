@@ -17,13 +17,13 @@ jobs:
       - name: Install XcodeGen 2.42.0
         # Pinned to the version this project is developed against: 2.45.x emits a
         # project.pbxproj objectVersion Xcode 15.4 (this image's default) cannot read
-        # ("Unable to read project"). Release binary, not brew, so the pin is exact.
         run: |
           curl -sL -o /tmp/xcodegen.zip https://github.com/yonaskolb/XcodeGen/releases/download/2.42.0/xcodegen.zip
           unzip -q -o /tmp/xcodegen.zip -d /tmp/xcodegen
-          chmod +x /tmp/xcodegen/xcodegen
-          echo /tmp/xcodegen >> "$GITHUB_PATH"
-          xcodegen --version
+          BIN=$(find /tmp/xcodegen -type f -name xcodegen | head -1)
+          chmod +x "$BIN"
+          echo "$(dirname "$BIN")" >> "$GITHUB_PATH"
+          "$BIN" --version
       - name: Generate project
         run: xcodegen generate
       - name: Build and test
