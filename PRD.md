@@ -68,9 +68,9 @@ In dependency order; F1–F6 are delivered (F6 partially — see table). F7 rema
 | F1 | **Write path, online-only**: check-in/out (`POST /work-logs/check-in\|out`), work-log status advance | both | First mutation; establishes idempotency keys (client UUIDs), error UX, optimistic store updates | M3 ✅ |
 | F2 | **Sync status surfacing**: `lastSyncedAt`/`lastSyncError` UI in Settings + offline banner | iOS | Sync failures are currently invisible (os_log only) | M3 ✅ |
 | F3 | **Outbox worker**: drain `SyncOutbox`, retry, idempotent replay, per-record dirty flags, reconcile-by-clientUuid | both | PP.10 core; turns M3's online writes into offline-capable writes | M4 ✅ |
-| F4 | **Photo pipeline**: capture → local persist → append-only upload; resolved on API-passthrough multipart | both | Photos are append-only per PP.10 | M4 ✅ (library picker only; camera source not yet wired) |
+| F4 | **Photo pipeline**: capture → local persist → append-only upload; resolved on API-passthrough multipart | both | Photos are append-only per PP.10 | M4 ✅ (library picker + camera source wired; camera is device-only, simulator self-hides the option) |
 | F5 | **Background refresh**: `BGAppRefreshTask` scheduling around SyncEngine | iOS | Currently foreground-only | M4 ✅ |
-| F6 | **Release plumbing**: staging base URL (placeholder), app icon, TestFlight signing, versioning | iOS | Blocks any human trial | Signing + `workflow_dispatch` TestFlight release workflow wired (M7-prep); pending ASC secrets + ASC app record + real staging host |
+| F6 | **Release plumbing**: staging base URL, app icon, TestFlight signing, versioning | iOS | Blocks any human trial | App record + ASC API-key secrets done, staging URL baked, icon present, `workflow_dispatch` TestFlight workflow wired; CI must go green (Xcode pin) before first upload |
 | F7 | **Push notifications (APNs)**: dispatch-driven schedule changes | both | Needs backend notification fan-out; `notifications` module has no v1 surface | M6 |
 
 ## 5. Parity matrix
@@ -116,7 +116,7 @@ In dependency order; F1–F6 are delivered (F6 partially — see table). F7 rema
 | Offline banner + sync status (F2) | M3 ✅ |
 | Background refresh (F5) | M4 ✅ |
 | Biometric unlock (Face ID gate on stored session) | M4 ✅ |
-| Camera-first photo capture (F4) | M4 partial ✅ (library picker; camera source not yet wired) |
+| Camera-first photo capture (F4) | M4 ✅ (library picker + camera source; camera is device-only) |
 | Push notifications for schedule changes (F7) | M6 |
 
 ## 6. Milestones
