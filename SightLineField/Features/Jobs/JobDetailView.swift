@@ -25,6 +25,8 @@ struct JobDetailView: View {
     @State private var checkOutTarget: WorkLog?
     @State private var pickerItem: PhotosPickerItem?
     @State private var assignTarget: Surface?
+    @State private var isCameraPresented = false
+    @State private var pendingCameraEntity: (entityType: String, entityId: String)?
 
     init(job: JobSummary) {
         self.job = job
@@ -87,7 +89,19 @@ struct JobDetailView: View {
             }
 
             Section("Photos") {
-                PhotosPicker(selection: $pickerItem, matching: .images) {
+                Menu {
+                    PhotosPicker(selection: $pickerItem, matching: .images) {
+                        Label("Photo Library", systemImage: "photo.on.rectangle")
+                    }
+                    if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                        Button {
+                            pendingCameraEntity = (entityType: "job", entityId: job.id)
+                            isCameraPresented = true
+                        } label: {
+                            Label("Take Photo", systemImage: "camera")
+                        }
+                    }
+                } label: {
                     Text("Add Photo")
                 }
                 if !pendingPhotoUploads.isEmpty {
@@ -127,6 +141,16 @@ struct JobDetailView: View {
         }
         .sheet(item: $assignTarget) { surface in
             AssignSurfaceSheet(jobId: job.id, surface: surface)
+        }
+        .sheet(isPresented: $isCameraPresented) {
+            if let entity = pendingCameraEntity {
+                CameraCaptureView { data in
+                    photoActions.enqueuePhoto(
+                        entityType: entity.entityType, entityId: entity.entityId,
+                        imageData: Self.jpegData(from: data)
+                    )
+                }
+            }
         }
         .onChange(of: pickerItem) { _, newItem in
             Task {
@@ -184,6 +208,7 @@ private struct SurfaceRow: View {
 
     @Environment(PhotoActions.self) private var photoActions
     @State private var pickerItem: PhotosPickerItem?
+    @State private var isCameraPresented = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -215,7 +240,16 @@ private struct SurfaceRow: View {
 
                 Spacer(minLength: 8)
 
-                PhotosPicker(selection: $pickerItem, matching: .images) {
+                Menu {
+                    PhotosPicker(selection: $pickerItem, matching: .images) {
+                        Label("Photo Library", systemImage: "photo.on.rectangle")
+                    }
+                    if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                        Button { isCameraPresented = true } label: {
+                            Label("Take Photo", systemImage: "camera")
+                        }
+                    }
+                } label: {
                     Label("Add Photo", systemImage: "camera")
                         .labelStyle(.iconOnly)
                         .font(DS.Font.body)
@@ -230,6 +264,14 @@ private struct SurfaceRow: View {
                 if await JobDetailView.loadAndEnqueue(newItem, entityType: "surface", entityId: surface.id, photoActions: photoActions) {
                     pickerItem = nil
                 }
+            }
+        }
+        .sheet(isPresented: $isCameraPresented) {
+            CameraCaptureView { data in
+                photoActions.enqueuePhoto(
+                    entityType: "surface", entityId: surface.id,
+                    imageData: JobDetailView.jpegData(from: data)
+                )
             }
         }
     }
@@ -249,3 +291,48 @@ private struct SurfaceStatusChip: View {
             .background(DS.Color.surfaceStatus(status), in: Capsule())
     }
 }
+
+/// Live camera capture (F4 gap: M4b shipped library-picker-only). Both "Add Photo" affordances
+/// are now a two-choice menu — library picker plus, on devices with a camera, this sheet; the
+/// captured frame rides the exact same offline path (`PhotoActions.enqueuePhoto` through the
+/// caller's JPEG conversion). The simulator has no camera, so `isSourceTypeAvailable(.camera)`
+/// hides "Take Photo" there and no UITest can exercise it — device-only by nature.
+#if canImport(UIKit)
+struct CameraCaptureView: UIViewControllerRepresentable {
+    let onCapture: (Data) -> Void
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = .camera
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(onCapture: onCapture) }
+
+    @MainActor
+    final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+        let onCapture: (Data) -> Void
+
+        init(onCapture: @escaping (Data) -> Void) {
+            self.onCapture = onCapture
+        }
+
+        func imagePickerController(
+            _ picker: UIImagePickerController,
+            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+        ) {
+            defer { picker.dismiss(animated: true) }
+            guard let image = info[.originalImage] as? UIImage,
+                  let data = image.jpegData(compressionQuality: 0.8) else { return }
+            onCapture(data)
+        }
+
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            picker.dismiss(animated: true)
+        }
+    }
+}
+#endif

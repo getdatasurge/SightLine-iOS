@@ -1,11 +1,19 @@
+import SwiftData
 import SwiftUI
-
 @MainActor
 struct SettingsSheet: View {
     @Environment(SessionManager.self) private var session
     @Environment(SyncEngine.self) private var syncEngine
     @Environment(OutboxWorker.self) private var outbox
     @State private var isLoggingOut = false
+    /// `.conflict` rows — surfaced by the Retry button below; `retry(clientUuid:)` un-sticks each
+    /// one back to `.pending` and the follow-up `drain()` replays it.
+    @Query private var conflictedRows: [SyncOutbox]
+
+    init() {
+        let conflict = OutboxState.conflict.rawValue
+        _conflictedRows = Query(filter: #Predicate<SyncOutbox> { $0.state == conflict })
+    }
 
     var body: some View {
         NavigationStack {
@@ -69,9 +77,20 @@ struct SettingsSheet: View {
                         .accessibilityIdentifier("outbox-pending")
                     }
                     if outbox.conflictCount > 0 {
-                        Text("\(outbox.conflictCount) need attention")
+                        HStack {
+                            Text("\(outbox.conflictCount) need attention")
+                                .font(DS.Font.caption)
+                                .foregroundStyle(DS.Color.destructive)
+                            Spacer()
+                            Button("Retry All") {
+                                for row in conflictedRows {
+                                    outbox.retry(clientUuid: row.clientUuid)
+                                }
+                                Task { await outbox.drain() }
+                            }
                             .font(DS.Font.caption)
-                            .foregroundStyle(DS.Color.destructive)
+                            .accessibilityIdentifier("outbox-retry-all")
+                        }
                     }
                 }
 
