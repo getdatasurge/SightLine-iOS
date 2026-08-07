@@ -4,6 +4,11 @@ import HTTPTypes
 
 protocol TokenRefresher: Sendable {
     func refreshTokens() async -> Bool
+    /// Called when a request still gets 401 after a successful `refreshTokens()` — the
+    /// freshly reissued access token was itself rejected, which means the *session* (not
+    /// just the token) has been invalidated server-side, e.g. stolen/reused refresh token.
+    /// A plain 401 with a *failed* refresh must NOT trigger this.
+    func sessionInvalidated() async
 }
 
 struct BearerAuthMiddleware: ClientMiddleware {
@@ -28,6 +33,10 @@ struct BearerAuthMiddleware: ClientMiddleware {
         guard response.status.code == 401, await refresher.refreshTokens() else {
             return (response, responseBody)
         }
-        return try await next(authed(request), body, baseURL)
+        let (retryResponse, retryBody) = try await next(authed(request), body, baseURL)
+        if retryResponse.status.code == 401 {
+            await refresher.sessionInvalidated()
+        }
+        return (retryResponse, retryBody)
     }
 }

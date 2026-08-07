@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- App Store / TestFlight export options for `xcodebuild -exportArchive`.
+     `destination: upload` ships the build straight to App Store Connect /
+     TestFlight in the same step, authenticated by the App Store Connect API
+     key passed to xcodebuild. -->
+<plist version="1.0">
+<dict>
+	<key>method</key>
+	<string>app-store</string>
+	<key>destination</key>
+	<string>upload</string>
+	<key>signingStyle</key>
+	<string>automatic</string>
+	<key>teamID</key>
+	<string>S67XP8A7UZ</string>
+	<key>uploadSymbols</key>
+	<true/>
+	<!-- Respect the build number we stamp in CI; don't let Xcode auto-manage it. -->
+	<key>manageAppVersionAndBuildNumber</key>
+	<false/>
+</dict>
+</plist>

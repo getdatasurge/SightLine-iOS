@@ -29,6 +29,9 @@ enum DS {
         /// design.json:198 `var(--muted-foreground, #5c666e)`.
         static let textSecondary = SwiftUI.Color(hex: 0x5C666E)
 
+        /// Destructive-action tint, codified from the settings logout review nit.
+        static let destructive = SwiftUI.Color.red
+
         /// Chip fill for a `Surface.status` value. The web app models "normal" states as one
         /// grey chip and reserves color for severity (DESIGN.md's Severity-Only Rule); it has
         /// no chip vocabulary for a multi-stage fabrication pipeline (MEASURED/CUT/FILM_CUT/
@@ -82,6 +85,15 @@ enum DS {
         /// DESIGN.md:40-44 `label`: 12px / weight 500 — closest DESIGN.md scale rung to
         /// SwiftUI's "caption" role (DESIGN.md has no literal "caption" token).
         static let caption = SwiftUI.Font.custom("IBM Plex Sans", size: 12).weight(.medium)
+    }
+
+    /// HIG minimum tappable-control size (44×44pt, `reference/ios.md`'s "Touch targets"
+    /// floor). Additive M5c token — reused by every icon-only per-row action on the survey
+    /// screens (`JobElevationsView`'s "Capture Pane", `JobDetailView`'s per-surface "Assign
+    /// to Elevation"/"Add Photo") so a small SF Symbol glyph never renders a smaller hit
+    /// target than HIG requires, regardless of the glyph's own intrinsic size.
+    enum Layout {
+        static let minTouchTarget: CGFloat = 44
     }
 }
 

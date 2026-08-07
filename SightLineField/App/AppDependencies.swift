@@ -1,5 +1,8 @@
 import Foundation
 import SwiftData
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// App composition root: wires `AppEnvironment` → `KeychainTokenStore` → `Client` →
 /// `LiveAuthGateway` → `SessionManager`, plus the SwiftData `ModelContainer`, and hands both
@@ -22,16 +25,33 @@ import SwiftData
 @MainActor
 final class AppDependencies {
     let session: SessionManager
+    let client: Client
     let modelContainer: ModelContainer
+    let syncEngine: SyncEngine
+    let workLogActions: WorkLogActions
+    let connectivity: Connectivity
+    let biometricGate: BiometricGate
+    let backgroundRefresher: BackgroundRefresher
+    let photoActions: PhotoActions
+    let elevationActions: ElevationActions
+    let surfaceActions: SurfaceActions
 
     init(environment: AppEnvironment = .resolve(), inMemoryStore: Bool = false) {
         let tokenStore = KeychainTokenStore()
 
         // UITest isolation: wipe any persisted session before wiring anything, so every
         // UI-test launch starts signed out regardless of what a prior run left behind.
-        if ProcessInfo.processInfo.arguments.contains("-uitest-reset") {
+        let uitestReset = ProcessInfo.processInfo.arguments.contains("-uitest-reset")
+        if uitestReset {
             tokenStore.clear()
             UserDefaults.standard.removeObject(forKey: "accountContext")
+            // UI-test determinism: with animations disabled there is no in-flight sheet-present
+            // CATransaction for XCUITest to wait on, so a late `syncBuildings()` save landing
+            // mid-transition (the diagnosed JobElevationsView quiescence race) can't keep the
+            // accessibility snapshot from ever settling. No-op outside UI tests.
+            #if canImport(UIKit)
+            UIView.setAnimationsEnabled(false)
+            #endif
         }
         let refresherBox = SessionRefresherBox()
 
@@ -39,15 +59,83 @@ final class AppDependencies {
         let gateway = LiveAuthGateway(client: client)
         let session = SessionManager(gateway: gateway, tokenStore: tokenStore)
         refresherBox.session = session
+        self.client = client
         self.session = session
 
+        let container: ModelContainer
         do {
-            modelContainer = try StoreContainer.make(inMemory: inMemoryStore)
+            container = try StoreContainer.make(inMemory: inMemoryStore || uitestReset)
         } catch {
             // A local SwiftData store failing to open (disk full, corrupt file, migration
             // failure) leaves the app with no usable data layer — nothing downstream can
             // recover from this, so fail fast rather than limp along without persistence.
             fatalError("Failed to create SwiftData ModelContainer: \(error)")
+        }
+        self.modelContainer = container
+
+        let watermarks = SyncWatermarks(defaults: .standard)
+        // UITest isolation: a `-uitest-reset` launch runs on a fresh in-memory store (above), so
+        // drop the delta watermarks too — otherwise a stale watermark makes the first sync a
+        // no-op delta against an empty store and no jobs would ever appear.
+        if uitestReset { watermarks.clearAll() }
+        self.syncEngine = SyncEngine(
+            backend: LiveSyncBackend(client: client),
+            modelContext: container.mainContext,
+            watermarks: watermarks
+        )
+
+        self.workLogActions = WorkLogActions(client: client, modelContext: container.mainContext)
+
+        // M4b: photo uploads replay through the same outbox `WorkLogActions` writes into, so
+        // both actions classes drain one queue instead of racing two.
+        workLogActions.outboxWorker.photoGateway = LivePhotoUploadGateway(environment: environment, tokenStore: tokenStore)
+        self.photoActions = PhotoActions(outboxWorker: workLogActions.outboxWorker, modelContext: container.mainContext)
+        self.backgroundRefresher = BackgroundRefresher(outboxWorker: workLogActions.outboxWorker, syncEngine: syncEngine)
+
+        // M5a: field-added elevation creation + pane assignment replay through the same one
+        // outbox `WorkLogActions`/`PhotoActions` drain, so `surveyGateway` is set on that shared
+        // worker rather than a second one racing it.
+        workLogActions.outboxWorker.surveyGateway = LiveSurveyWriteGateway(client: client)
+        self.elevationActions = ElevationActions(outboxWorker: workLogActions.outboxWorker, modelContext: container.mainContext)
+
+        // M5b: field pane capture replays through the same shared outbox; the capture gateway
+        // rides beside `surveyGateway`/`photoGateway` on that one worker.
+        workLogActions.outboxWorker.surfaceCaptureGateway = LiveSurfaceCaptureGateway(client: client)
+        self.surfaceActions = SurfaceActions(outboxWorker: workLogActions.outboxWorker, modelContext: container.mainContext)
+
+        // Mirrors the `-uitest-reset` isolation above: disabled entirely so an automated launch
+        // never blocks on a biometric prompt it has no way to satisfy.
+        self.biometricGate = BiometricGate(enabled: !uitestReset)
+
+        self.connectivity = Connectivity()
+        connectivity.onBecameOnline = { [weak workLogActions] in
+            Task { await workLogActions?.outboxWorker.drain() }
+        }
+
+        // UITest hook (paired with `-uitest-reset`): suppresses the outbox drain so a queued
+        // write stays local-only and observable in Settings instead of racing the live backend
+        // — see `OfflineOutboxUITests`.
+        if ProcessInfo.processInfo.arguments.contains("-uitest-outbox-hold") {
+            workLogActions.outboxWorker.isHeld = true
+        }
+
+        // Every sign-out (explicit logout, expired bootstrap, 401 theft-signal) must leave no
+        // trace of the prior account on a shared installer device: drop the delta watermarks so
+        // the next sign-in does a full pull, and wipe the cached rows. Runs on the MainActor —
+        // `clearAll` is only ever reached from MainActor-isolated SessionManager methods.
+        session.onSignedOut = { [weak container] in
+            watermarks.clearAll()
+            guard let context = container?.mainContext else { return }
+            try? context.delete(model: JobSummary.self)
+            try? context.delete(model: Appointment.self)
+            try? context.delete(model: WorkType.self)
+            try? context.delete(model: WorkLog.self)
+            try? context.delete(model: Surface.self)
+            try? context.delete(model: Building.self)
+            try? context.delete(model: Elevation.self)
+            // A shared installer device must never replay the prior account's queued writes
+            // under the next technician: drop the outbox rows too, not just the synced data.
+            try? context.delete(model: SyncOutbox.self)
         }
     }
 }
@@ -63,5 +151,9 @@ private final class SessionRefresherBox: TokenRefresher, @unchecked Sendable {
     func refreshTokens() async -> Bool {
         guard let session else { return false }
         return await session.refreshTokens()
+    }
+
+    func sessionInvalidated() async {
+        await session?.sessionInvalidated()
     }
 }

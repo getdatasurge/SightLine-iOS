@@ -13,6 +13,13 @@ struct AccountContext: Equatable, Codable, Sendable {
     let capabilities: [String]
 }
 
+/// Result of `GET /technicians/me`: the caller's own technician id (if the account is
+/// bound to a technician row) plus their live capability grants.
+struct Identity: Equatable, Sendable {
+    var technicianId: String?
+    var capabilities: [String]
+}
+
 struct DeviceInfo: Equatable, Sendable {
     let name: String
     let model: String
@@ -41,6 +48,7 @@ protocol AuthGateway: Sendable {
     func login(email: String, password: String, device: DeviceInfo) async throws -> (TokenPair, AccountContext)
     func refresh(refreshToken: String) async throws -> TokenPair
     func logout(sessionId: String) async
+    func fetchIdentity() async throws -> Identity
 }
 
 /// Wraps the generated `Client` for `/device-auth/*`. There is no `/auth/me`: the account
@@ -132,6 +140,32 @@ struct LiveAuthGateway: AuthGateway {
         _ = try? await client.delete_sol_device_hyphen_auth_sol_sessions_sol__lcub_id_rcub_(.init(path: .init(id: sessionId)))
     }
 
+    /// `GET /technicians/me` — the caller's own technician row + live capability grants.
+    /// Freeform `data` payload (no schema in the spec, just `summary`), same treatment as
+    /// login/refresh: round-tripped through `decodeData` into `TechnicianMeData`.
+    func fetchIdentity() async throws -> Identity {
+        let response: Operations.get_sol_technicians_sol_me.Output
+        do {
+            response = try await client.get_sol_technicians_sol_me()
+        } catch {
+            throw ApiError.network(error)
+        }
+        switch response {
+        case .ok(let ok):
+            let payload = try ok.body.json
+            let data = try decodeData(payload.data.additionalProperties, as: TechnicianMeData.self)
+            return Identity(technicianId: data.technician?.id, capabilities: data.capabilities)
+        case .unauthorized: throw ApiError.unauthorized
+        case .badRequest: throw ApiError.server(status: 400)
+        case .forbidden: throw ApiError.server(status: 403)
+        case .notFound: throw ApiError.server(status: 404)
+        case .conflict: throw ApiError.server(status: 409)
+        case .tooManyRequests: throw ApiError.server(status: 429)
+        case .internalServerError: throw ApiError.server(status: 500)
+        case .undocumented(let statusCode, _): throw ApiError.server(status: statusCode)
+        }
+    }
+
     private func decodeData<T: Decodable>(_ container: OpenAPIObjectContainer, as type: T.Type) throws -> T {
         do {
             let data = try JSONEncoder().encode(container)
@@ -159,4 +193,16 @@ private struct DeviceAuthLoginData: Decodable {
 private struct DeviceAuthRefreshData: Decodable {
     let accessToken: String
     let refreshToken: String
+}
+
+/// Mirrors the `data` payload of `GET /technicians/me`'s 200 response. Shape inferred from
+/// the spec's `summary` ("caller's own Technician row ... plus their live capabilities")
+/// since the schema itself is undocumented freeform `additionalProperties: true` — not
+/// independently verifiable against a live server response, flagged for confirmation.
+private struct TechnicianMeData: Decodable {
+    struct Technician: Decodable {
+        let id: String
+    }
+    let technician: Technician?
+    let capabilities: [String]
 }

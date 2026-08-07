@@ -13,6 +13,11 @@ final class SessionManager: TokenRefresher {
     private(set) var state: State = .signedOut
     var lastError: ApiError?
 
+    /// Invoked by every sign-out path (`clearAll`) so the composition root can wipe local
+    /// caches (SwiftData rows + sync watermarks) that must not leak across accounts on a
+    /// shared installer device. Set once by `AppDependencies`; nil in tests.
+    var onSignedOut: (() -> Void)?
+
     private let gateway: AuthGateway
     private let tokenStore: TokenStore
     private let defaults: UserDefaults
@@ -35,6 +40,7 @@ final class SessionManager: TokenRefresher {
             return
         }
         state = .signedIn(context)
+        await applyIdentity(to: context)
     }
 
     func login(email: String, password: String) async {
@@ -45,6 +51,7 @@ final class SessionManager: TokenRefresher {
             try tokenStore.save(pair)
             persist(context)
             state = .signedIn(context)
+            await applyIdentity(to: context)
         } catch {
             clearAll()
             state = .signedOut
@@ -64,6 +71,18 @@ final class SessionManager: TokenRefresher {
     /// it and stashes the `Task` on the actor, later callers just await that same `Task` —
     /// so N concurrent callers still produce exactly one `gateway.refresh` call.
     nonisolated func refreshTokens() async -> Bool { await coalescedRefresh() }
+
+    /// Called by `BearerAuthMiddleware` when a request still gets 401 after a successful
+    /// refresh — the session itself was invalidated server-side (theft/reuse signal), not
+    /// just the access token. Reuses the same clear-and-sign-out path as a rejected refresh.
+    nonisolated func sessionInvalidated() async {
+        await performSessionInvalidation()
+    }
+
+    private func performSessionInvalidation() {
+        clearAll()
+        state = .signedOut
+    }
 
     private func coalescedRefresh() async -> Bool {
         if let inFlight = inFlightRefresh { return await inFlight.value }
@@ -111,6 +130,25 @@ final class SessionManager: TokenRefresher {
         defaults.set(data, forKey: Self.contextKey)
     }
 
+    /// Bootstraps `technicianId`/`capabilities` from `GET /technicians/me` after a
+    /// successful `login()` or a `bootstrap()` that restored a valid session. Best-effort:
+    /// a throw (offline, 401, decoding, ...) leaves the caller's already-set `signedIn`
+    /// state exactly as it was — no error surfaced, no state change — since identity is an
+    /// enrichment, not a precondition for being signed in.
+    private func applyIdentity(to context: AccountContext) async {
+        guard let identity = try? await gateway.fetchIdentity() else { return }
+        let merged = AccountContext(
+            accountId: context.accountId,
+            email: context.email,
+            businessId: context.businessId,
+            sessionId: context.sessionId,
+            technicianId: identity.technicianId,
+            capabilities: identity.capabilities
+        )
+        persist(merged)
+        state = .signedIn(merged)
+    }
+
     private func loadPersistedContext() -> AccountContext? {
         guard let data = defaults.data(forKey: Self.contextKey) else { return nil }
         return try? JSONDecoder().decode(AccountContext.self, from: data)
@@ -121,5 +159,6 @@ final class SessionManager: TokenRefresher {
     private func clearAll() {
         tokenStore.clear()
         defaults.removeObject(forKey: Self.contextKey)
+        onSignedOut?()
     }
 }

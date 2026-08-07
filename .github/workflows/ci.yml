@@ -5,11 +5,25 @@ on:
     branches: [main]
 jobs:
   build-test:
-    runs-on: macos-15
+    # macos-15's simulator host traps ~2s into every app launch (missing eligibilityd
+    # plist in the sim container - an image/runtime defect, bisected via the .ips
+    # stacks: the SIGTRAP follows load_eligibility_plist and lands on whatever the
+    # main thread is doing). macos-14 ships the known-good pairing this suite is
+    # verified against locally: Xcode 15.4 + iOS 17 sims. Revisit when macos-14 is
+    # EOL (2026-11-02) or the macos-15 sim host is fixed.
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - name: Install XcodeGen
-        run: brew install xcodegen
+      - name: Install XcodeGen 2.42.0
+        # Pinned to the version this project is developed against: 2.45.x emits a
+        # project.pbxproj objectVersion Xcode 15.4 (this image's default) cannot read
+        run: |
+          curl -sL -o /tmp/xcodegen.zip https://github.com/yonaskolb/XcodeGen/releases/download/2.42.0/xcodegen.zip
+          unzip -q -o /tmp/xcodegen.zip -d /tmp/xcodegen
+          BIN=$(find /tmp/xcodegen -type f -name xcodegen | head -1)
+          chmod +x "$BIN"
+          echo "$(dirname "$BIN")" >> "$GITHUB_PATH"
+          "$BIN" --version
       - name: Generate project
         run: xcodegen generate
       - name: Build and test
@@ -19,3 +33,37 @@ jobs:
           xcodebuild -project SightLineField.xcodeproj -scheme SightLineField \
             -destination "platform=iOS Simulator,name=$SIM_NAME" \
             -skipPackagePluginValidation build test
+      - name: Dump simulator crash reports (on failure)
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          import json, os, glob
+          files = sorted(
+              glob.glob(os.path.expanduser("~/Library/Logs/DiagnosticReports/SightLineField-*.ips")),
+              key=os.path.getmtime,
+          )
+          print(f"found {len(files)} crash reports; dumping 3 most recent")
+          for f in files[-3:]:
+              with open(f) as fh:
+                  raw = fh.read()
+              body = None
+              for candidate in (raw, "\n".join(raw.splitlines()[1:]), raw.splitlines()[1] if len(raw.splitlines()) > 1 else raw):
+                  try:
+                      body = json.loads(candidate)
+                      break
+                  except Exception:
+                      continue
+              if body is None:
+                  print("  (unparseable; first 40 lines:)")
+                  print("\n".join(raw.splitlines()[:40]))
+                  continue
+              imgs = body.get("usedImages", [])
+              for i, t in enumerate(body.get("threads", [])):
+                  if not t.get("triggered"):
+                      continue
+                  print(f"--- crashed thread {i} name={t.get('name')} queue={t.get('queue')}")
+                  for fr in t.get("frames", [])[:40]:
+                      ii = fr.get("imageIndex", 0)
+                      img = imgs[ii].get("name", "?") if ii < len(imgs) else "?"
+                      print(f"  {img} :: {fr.get('symbol', '?')} +{fr.get('symbolLocation', '?')}")
+          PY
