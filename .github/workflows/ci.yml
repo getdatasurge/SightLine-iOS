@@ -19,3 +19,12 @@ jobs:
           xcodebuild -project SightLineField.xcodeproj -scheme SightLineField \
             -destination "platform=iOS Simulator,name=$SIM_NAME" \
             -skipPackagePluginValidation build test
+      - name: Dump simulator crash reports (on failure)
+        if: failure()
+        run: |
+          for f in ~/Library/Logs/DiagnosticLogs/*.ips ~/Library/Logs/DiagnosticLogs/*.crash; do
+            [ -f "$f" ] || continue
+            echo "===== $f ====="
+            sed -n '1,80p' "$f"
+          done
+          true
