@@ -3,17 +3,30 @@
 <!-- App Store / TestFlight export options for `xcodebuild -exportArchive`.
      `destination: upload` ships the build straight to App Store Connect /
      TestFlight in the same step, authenticated by the App Store Connect API
-     key passed to xcodebuild. -->
+     key passed to xcodebuild.
+
+     Manual signing: the distribution cert is imported into the CI keychain and
+     the provisioning profile installed by the release workflow (the team has
+     no registered devices and the API key cannot mint cloud-signed certs, so
+     automatic signing cannot work here). `provisioningProfiles` maps the
+     bundle id to the profile name installed from DIST_PROFILE_BASE64. -->
 <plist version="1.0">
 <dict>
 	<key>method</key>
-	<string>app-store</string>
+	<string>app-store-connect</string>
 	<key>destination</key>
 	<string>upload</string>
 	<key>signingStyle</key>
-	<string>automatic</string>
+	<string>manual</string>
+	<key>signingCertificate</key>
+	<string>Apple Distribution</string>
 	<key>teamID</key>
 	<string>S67XP8A7UZ</string>
+	<key>provisioningProfiles</key>
+	<dict>
+		<key>com.getdatasurge.sightline.field</key>
+		<string>SightLine Field App Store CI</string>
+	</dict>
 	<key>uploadSymbols</key>
 	<true/>
 	<!-- Respect the build number we stamp in CI; don't let Xcode auto-manage it. -->
