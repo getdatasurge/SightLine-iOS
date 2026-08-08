@@ -60,13 +60,6 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: S67XP8A7UZ
-      configs:
-        # Archive/distribution must use the Apple Distribution identity. Without
-        # this, Release inherits "iPhone Developer", and automatic signing tries
-        # to mint a *development* profile — which requires a registered device
-        # (the team has none) and fails CI. Distribution profiles need none.
-        Release:
-          CODE_SIGN_IDENTITY: Apple Distribution
   SightLineFieldTests:
     type: bundle.unit-test
     platform: iOS
